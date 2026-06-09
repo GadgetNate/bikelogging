@@ -169,8 +169,13 @@ Bluetooth:
 ```bash
 rfkill list bluetooth
 hciconfig -a
-sudo timeout 12 btmgmt find
+sudo timeout 12 stdbuf -oL -eL btmgmt --index 0 find
 ```
+
+The RideHub dashboard shows the most recent Bluetooth scan state, completion
+time, device count, names, addresses, address types, and RSSI values. A scan
+can legitimately omit devices that are not advertising. Phones often require
+Bluetooth settings or pairing mode to be open before they advertise visibly.
 
 Camera:
 
@@ -179,6 +184,10 @@ rpicam-hello --list-cameras
 ```
 
 On some newer Raspberry Pi OS installs, the old command `libcamera-hello` is replaced by `rpicam-hello`.
+
+The default Pi configuration rotates captured photos 180 degrees because the
+camera is mounted upside down. Set `camera_rotation_degrees` to `0` in
+`/opt/bikelogger/config.json` if the camera mounting changes.
 
 ## Version control method
 

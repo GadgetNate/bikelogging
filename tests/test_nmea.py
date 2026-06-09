@@ -105,3 +105,53 @@ def test_waveshare_ups_hat_rejects_invalid_voltage_range():
         assert False
     except ValueError:
         pass
+
+def test_parse_btmgmt_devices():
+    output = '''
+Discovery started
+hci0 dev_found: AA:BB:CC:DD:EE:01 type LE Random rssi -72 flags 0x0000 name Bike Sensor
+hci0 dev_found: AA:BB:CC:DD:EE:02 type BR/EDR rssi -41 flags 0x0000 eir_len 12
+hci0 dev_found: AA:BB:CC:DD:EE:01 type LE Random rssi -58 flags 0x0000 name Bike Sensor
+'''
+    rows = mod.parse_btmgmt_devices(output)
+
+    assert len(rows) == 2
+    assert rows[0]['address'] == 'AA:BB:CC:DD:EE:02'
+    assert rows[0]['address_type'] == 'BR/EDR'
+    assert rows[1]['address'] == 'AA:BB:CC:DD:EE:01'
+    assert rows[1]['name'] == 'Bike Sensor'
+    assert rows[1]['rssi_dbm'] == -58
+
+def test_parse_btmgmt_devices_multiline_name_and_ansi():
+    output = '\x1b[0mhci1 dev_found: 11:22:33:44:55:66 type LE Public rssi -63 flags 0x0004\nname Heart Rate Monitor\n'
+    rows = mod.parse_btmgmt_devices(output)
+
+    assert rows == [{
+        'adapter':'hci1',
+        'address':'11:22:33:44:55:66',
+        'address_type':'LE Public',
+        'rssi_dbm':-63,
+        'flags':'0x0004',
+        'raw_lines':[
+            'hci1 dev_found: 11:22:33:44:55:66 type LE Public rssi -63 flags 0x0004',
+            'name Heart Rate Monitor'
+        ],
+        'name':'Heart Rate Monitor'
+    }]
+
+def test_dashboard_helpers_escape_content():
+    table = mod.data_table([{'name':'<script>','rssi':-40}],[('name','Name'),('rssi','RSSI')])
+    page = mod.page('Test <title>', table, refresh=5)
+
+    assert '&lt;script&gt;' in page
+    assert '<script>' not in page
+    assert 'content="5"' in page
+
+def test_camera_transform_options():
+    assert mod.camera_transform_options(0) == {'hflip':0,'vflip':0}
+    assert mod.camera_transform_options(180) == {'hflip':1,'vflip':1}
+    try:
+        mod.camera_transform_options(90)
+        assert False
+    except ValueError:
+        pass

@@ -8,7 +8,7 @@ import os, sys, time, json, math, glob, sqlite3, threading, subprocess, shutil, 
 from datetime import datetime, timezone
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 
 APP_DIR = Path('/opt/bikelogger')
 DATA_DIR = Path(os.environ.get('BIKELOGGER_DATA', '/var/lib/bikelogger'))
@@ -28,9 +28,10 @@ def load_config():
         'web_host': '0.0.0.0', 'web_port': 8080,
         'gps_port': '/dev/serial0', 'gps_baud': 38400,
         'camera_interval_sec': 5.0, 'camera_width': 2304, 'camera_height': 1296,
-        'camera_quality': 92, 'camera_autofocus': 'continuous',
+        'camera_quality': 92, 'camera_autofocus': 'continuous', 'camera_rotation_degrees': 180,
         'env_interval_sec': 2.0, 'gps_interval_note': 'GPS logs as NMEA sentences arrive',
         'wifi_interval_sec': 30.0, 'bluetooth_interval_sec': 60.0, 'bluetooth_scan_duration_sec': 10.0, 'health_interval_sec': 10.0,
+        'bluetooth_adapter_index': 0,
         'start_button_gpio': 27, 'stop_button_gpio': 17,
         'button_bounce_sec': 0.15,
         'i2c_bus': 1, 'bme280_addresses': [0x76, 0x77],
@@ -70,7 +71,10 @@ class State:
         self.last_health = {}
         self.last_camera = {}
         self.last_wifi_count = 0
+        self.last_wifi_devices = []
         self.last_bluetooth_count = 0
+        self.last_bluetooth_devices = []
+        self.bluetooth_status = {'state':'not scanned'}
         self.camera_status = 'not initialized'
         self.errors = []
     def add_error(self, msg):
@@ -436,12 +440,20 @@ class UPSWorker(threading.Thread):
                 STATE.add_error(f'Waveshare UPS HAT read: {e}')
             time.sleep(max(0.2, float(CONFIG['ups_interval_sec'])))
 
+def camera_transform_options(rotation_degrees):
+    rotation=int(rotation_degrees)
+    if rotation == 0:
+        return {'hflip':0,'vflip':0}
+    if rotation == 180:
+        return {'hflip':1,'vflip':1}
+    raise ValueError(f'camera_rotation_degrees must be 0 or 180, got {rotation}')
+
 class CameraWorker(threading.Thread):
     daemon=True
     def run(self):
         try:
             from picamera2 import Picamera2
-            from libcamera import controls
+            from libcamera import controls, Transform
         except Exception as e:
             STATE.camera_status = f'picamera2 unavailable: {e}'
             STATE.add_error(STATE.camera_status); return
@@ -450,14 +462,18 @@ class CameraWorker(threading.Thread):
             try:
                 if picam is None:
                     picam=Picamera2()
-                    cfg=picam.create_still_configuration(main={'size': (int(CONFIG['camera_width']), int(CONFIG['camera_height']))})
+                    transform=Transform(**camera_transform_options(CONFIG.get('camera_rotation_degrees',180)))
+                    cfg=picam.create_still_configuration(
+                        main={'size': (int(CONFIG['camera_width']), int(CONFIG['camera_height']))},
+                        transform=transform
+                    )
                     picam.configure(cfg); picam.start(); time.sleep(2)
                     try:
                         if CONFIG.get('camera_autofocus') == 'continuous': picam.set_controls({'AfMode': controls.AfModeEnum.Continuous})
                         else: picam.set_controls({'AfMode': controls.AfModeEnum.Auto})
                     except Exception as e: STATE.add_error(f'Camera AF control warning: {e}')
                     STATE.camera_status='ready'
-                    print('Camera ready', flush=True)
+                    print(f'Camera ready, rotation {int(CONFIG.get("camera_rotation_degrees",180))} degrees', flush=True)
                 should=False
                 with STATE.lock:
                     should=bool(STATE.ride_id) or bool(CONFIG.get('capture_when_idle'))
@@ -467,7 +483,7 @@ class CameraWorker(threading.Thread):
                     try:
                         # Trigger AF cycle if not continuous; continuous will keep adjusting while bike moves.
                         picam.capture_file(str(out))
-                        ts=now_iso(); data={'file': f'photos/{fname}', 'bytes': out.stat().st_size}
+                        ts=now_iso(); data={'file': f'photos/{fname}', 'bytes': out.stat().st_size, 'captured_at':ts}
                         with STATE.lock: STATE.last_camera=data; STATE.camera_status='captured'
                         if STATE.db: db_exec('insert into camera values(?,?,?,?,?,?)',(ts,f'photos/{fname}',int(CONFIG['camera_width']),int(CONFIG['camera_height']),'ok',json.dumps(data)))
                     except Exception as e:
@@ -511,66 +527,111 @@ class WiFiWorker(threading.Thread):
     def run(self):
         while RUNNING:
             rows=wifi_scan_once(); ts=now_iso()
-            with STATE.lock: STATE.last_wifi_count=len(rows)
+            rows=sorted(rows, key=lambda r: r.get('signal_dbm') if r.get('signal_dbm') is not None else -999, reverse=True)
+            with STATE.lock:
+                STATE.last_wifi_count=len(rows)
+                STATE.last_wifi_devices=rows[:20]
             if STATE.db:
                 for r in rows:
                     db_exec('insert into wifi values(?,?,?,?,?,?,?,?)',(ts,r.get('iface'),r.get('bssid'),r.get('ssid',''),r.get('signal_dbm'),r.get('freq_mhz'),None,json.dumps(r)))
             time.sleep(float(CONFIG['wifi_interval_sec']))
 
+def parse_btmgmt_devices(text):
+    rows=[]
+    current=None
+    device_re=re.compile(r'hci(?P<index>\d+)\s+dev_found:\s+(?P<address>[0-9A-Fa-f:]{17})\s+type\s+(?P<type>.+?)\s+rssi\s+(?P<rssi>-?\d+)\s+flags\s+(?P<flags>\S+)(?P<tail>.*)$', re.I)
+    name_re=re.compile(r'^(?:name|short_name)\s+(.+)$', re.I)
+    for raw in text.splitlines():
+        line=re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', raw).strip()
+        if not line:
+            continue
+        match=device_re.search(line)
+        if match:
+            if current:
+                rows.append(current)
+            current={
+                'adapter':f'hci{match.group("index")}',
+                'address':match.group('address').upper(),
+                'address_type':match.group('type').strip(),
+                'rssi_dbm':int(match.group('rssi')),
+                'flags':match.group('flags'),
+                'raw_lines':[line]
+            }
+            inline_name=re.search(r'(?:^|\s)(?:name|short_name)\s+(.+)$',match.group('tail'),re.I)
+            if inline_name and CONFIG.get('log_bluetooth_names', True):
+                current['name']=inline_name.group(1).strip().strip('"')
+            continue
+        if current:
+            current['raw_lines'].append(line)
+            match=name_re.match(line)
+            if match and CONFIG.get('log_bluetooth_names', True):
+                current['name']=match.group(1).strip().strip('"')
+    if current:
+        rows.append(current)
+    best={}
+    for row in rows:
+        key=(row.get('adapter'),row.get('address'))
+        previous=best.get(key)
+        if previous is None or row.get('rssi_dbm',-999) > previous.get('rssi_dbm',-999):
+            best[key]=row
+    return sorted(best.values(), key=lambda r: r.get('rssi_dbm',-999), reverse=True)
+
 def bluetooth_scan_once():
     """Scan with the Pi 4 built-in Bluetooth adapter and return nearby devices with RSSI when BlueZ reports it.
     Uses btmgmt because bluetoothctl commonly omits RSSI in scripted scans. Service runs as root.
     """
-    rows=[]
     duration=max(3, int(float(CONFIG.get('bluetooth_scan_duration_sec', 10))))
+    index=int(CONFIG.get('bluetooth_adapter_index', 0))
+    adapter=f'hci{index}'
+    status={'state':'starting','adapter':adapter,'started_at':now_iso(),'duration_sec':duration}
     try:
-        if not Path('/sys/class/bluetooth/hci0').exists():
-            return rows
-        subprocess.run(['rfkill','unblock','bluetooth'], text=True, capture_output=True, timeout=5)
-        subprocess.run(['btmgmt','--index','0','power','on'], text=True, capture_output=True, timeout=8)
-        # btmgmt find normally runs until interrupted; timeout is expected and useful here.
-        p=subprocess.run(['timeout', str(duration), 'btmgmt', '--index', '0', 'find'], text=True, capture_output=True, timeout=duration+5)
+        if not Path(f'/sys/class/bluetooth/{adapter}').exists():
+            status.update({'state':'unavailable','error':f'{adapter} not found','finished_at':now_iso(),'devices':0})
+            return [],status
+        unblock=subprocess.run(['rfkill','unblock','bluetooth'], text=True, capture_output=True, timeout=5)
+        power=subprocess.run(['btmgmt','--index',str(index),'power','on'], text=True, capture_output=True, timeout=8)
+        command=['timeout',str(duration)]
+        if shutil.which('stdbuf'):
+            command.extend(['stdbuf','-oL','-eL'])
+        command.extend(['btmgmt','--index',str(index),'find'])
+        p=subprocess.run(command, text=True, capture_output=True, timeout=duration+5)
         text=(p.stdout or '') + '\n' + (p.stderr or '')
-        current=None
-        for raw in text.splitlines():
-            line=raw.strip()
-            if not line:
-                continue
-            m=re.search(r'(hci\d+) dev_found: ([0-9A-Fa-f:]{17}) type ([^ ]+(?: [^ ]+)?) rssi (-?\d+)(?: flags (\S+))?', line)
-            if m:
-                if current:
-                    rows.append(current)
-                current={'adapter':m.group(1), 'address':m.group(2).upper(), 'address_type':m.group(3), 'rssi_dbm':int(m.group(4)), 'flags':m.group(5) or '', 'raw_lines':[line]}
-                continue
-            if current:
-                current.setdefault('raw_lines',[]).append(line)
-                # btmgmt may print name, short_name, or UUID/manufacturer data lines.
-                nm=re.match(r'(?:name|short_name)\s+(.+)$', line, re.I)
-                if nm and CONFIG.get('log_bluetooth_names', True):
-                    current['name']=nm.group(1).strip()
-        if current:
-            rows.append(current)
-        # De-duplicate within one scan, keeping strongest/latest report per address.
-        best={}
-        for r in rows:
-            key=(r.get('adapter'), r.get('address'))
-            if key not in best or (r.get('rssi_dbm') is not None and (best[key].get('rssi_dbm') is None or r.get('rssi_dbm') > best[key].get('rssi_dbm'))):
-                best[key]=r
-        return list(best.values())
+        rows=parse_btmgmt_devices(text)
+        errors=[]
+        if unblock.returncode != 0:
+            errors.append((unblock.stderr or unblock.stdout).strip())
+        if power.returncode != 0:
+            errors.append((power.stderr or power.stdout).strip())
+        if p.returncode not in (0,124):
+            errors.append(f'btmgmt exited {p.returncode}')
+        status.update({
+            'state':'ok' if rows else 'no devices',
+            'finished_at':now_iso(),
+            'devices':len(rows),
+            'return_code':p.returncode,
+            'errors':[error for error in errors if error],
+            'output_tail':'\n'.join(text.strip().splitlines()[-12:])
+        })
+        return rows,status
     except FileNotFoundError as e:
-        STATE.add_error(f'Bluetooth tool missing: {e}')
-    except subprocess.TimeoutExpired:
-        pass
+        status.update({'state':'error','error':f'tool missing: {e}','finished_at':now_iso(),'devices':0})
+    except subprocess.TimeoutExpired as e:
+        status.update({'state':'error','error':f'scan timeout: {e}','finished_at':now_iso(),'devices':0})
     except Exception as e:
-        STATE.add_error(f'Bluetooth scan: {e}')
-    return rows
+        status.update({'state':'error','error':str(e),'finished_at':now_iso(),'devices':0})
+    return [],status
 
 class BluetoothWorker(threading.Thread):
     daemon=True
     def run(self):
         while RUNNING:
-            rows=bluetooth_scan_once(); ts=now_iso()
-            with STATE.lock: STATE.last_bluetooth_count=len(rows)
+            rows,status=bluetooth_scan_once(); ts=now_iso()
+            with STATE.lock:
+                STATE.last_bluetooth_count=len(rows)
+                STATE.last_bluetooth_devices=rows[:50]
+                STATE.bluetooth_status=status
+            if status.get('state') in ('error','unavailable'):
+                STATE.add_error(f'Bluetooth scan: {status.get("error",status.get("state"))}')
             if STATE.db:
                 for r in rows:
                     db_exec('insert into bluetooth values(?,?,?,?,?,?,?,?)', (ts, r.get('adapter'), r.get('address'), r.get('address_type'), r.get('name',''), r.get('rssi_dbm'), r.get('flags',''), json.dumps(r)))
@@ -643,9 +704,90 @@ def list_rides():
         rides.append(info)
     return rides
 
-def page(title, body):
-    return f'''<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>{html.escape(title)}</title>
-<style>body{{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;margin:1rem;line-height:1.35}} a.button,button{{display:inline-block;padding:.6rem .9rem;margin:.2rem;border:1px solid #555;border-radius:.4rem;background:#eee;color:#111;text-decoration:none}} .card{{border:1px solid #ddd;border-radius:.5rem;padding:.8rem;margin:.7rem 0}} table{{border-collapse:collapse;width:100%}}td,th{{border-bottom:1px solid #ddd;padding:.35rem;text-align:left}} img{{max-width:220px;max-height:160px;margin:.25rem}} code,pre{{background:#f5f5f5;padding:.2rem;white-space:pre-wrap}}</style></head><body><h1>{html.escape(title)}</h1>{body}</body></html>'''
+def display_value(value, digits=2, suffix=''):
+    if value is None or value == '':
+        return '—'
+    if isinstance(value,float):
+        return f'{value:.{digits}f}{suffix}'
+    return f'{value}{suffix}'
+
+def metric(label, value, tone=''):
+    return f'<div class="metric {tone}"><span>{html.escape(label)}</span><strong>{html.escape(str(value))}</strong></div>'
+
+def data_table(rows, columns, empty='No data yet.'):
+    if not rows:
+        return f'<p class="muted">{html.escape(empty)}</p>'
+    head=''.join(f'<th>{html.escape(label)}</th>' for _,label in columns)
+    body=[]
+    for row in rows:
+        cells=''.join(f'<td>{html.escape(display_value(row.get(key)))}</td>' for key,_ in columns)
+        body.append(f'<tr>{cells}</tr>')
+    return f'<div class="table-wrap"><table><thead><tr>{head}</tr></thead><tbody>{"".join(body)}</tbody></table></div>'
+
+def latest_photos(limit=8, ride_id=None):
+    candidates=[]
+    if ride_id:
+        candidates=[RIDES_DIR/ride_id]
+    else:
+        with STATE.lock:
+            active=STATE.ride_id
+        if active:
+            candidates.append(RIDES_DIR/active)
+        candidates.extend(d for d in sorted(RIDES_DIR.glob('*'),reverse=True) if d not in candidates)
+    for ride_dir in candidates:
+        photo_dir=ride_dir/'photos'
+        if not photo_dir.exists():
+            continue
+        photos=sorted(photo_dir.glob('*.jpg'),key=lambda p:p.stat().st_mtime,reverse=True)[:limit]
+        if photos:
+            return [{'ride_id':ride_dir.name,'file':photo.name,'mtime':datetime.fromtimestamp(photo.stat().st_mtime).astimezone().isoformat(timespec='seconds')} for photo in photos]
+    return []
+
+def photo_gallery(photos):
+    if not photos:
+        return '<p class="muted">No photos captured yet.</p>'
+    items=[]
+    for photo in photos:
+        rid=quote(photo['ride_id'],safe='')
+        name=quote(photo['file'],safe='')
+        url=f'/ride/{rid}/photos/{name}'
+        items.append(f'<a class="photo" href="{url}"><img loading="lazy" src="{url}" alt="Ride photo"><span>{html.escape(photo["mtime"])}</span></a>')
+    return f'<div class="gallery">{"".join(items)}</div>'
+
+def ride_history_table(rides):
+    if not rides:
+        return '<p class="muted">No rides yet.</p>'
+    rows=[]
+    for ride in rides:
+        rid=html.escape(str(ride.get('id','')))
+        url=quote(str(ride.get('id','')),safe='')
+        rows.append(f'''<tr><td><a href="/ride/{url}">{rid}</a></td><td>{html.escape(display_value(ride.get("started_at")))}</td><td>{html.escape(display_value(ride.get("stopped_at")))}</td><td>{ride.get("gps",0)}</td><td>{ride.get("photos",0)}</td><td>{ride.get("bluetooth",0)}</td></tr>''')
+    return f'<div class="table-wrap"><table><thead><tr><th>Ride</th><th>Started</th><th>Stopped</th><th>GPS rows</th><th>Photos</th><th>Bluetooth rows</th></tr></thead><tbody>{"".join(rows)}</tbody></table></div>'
+
+def page(title, body, refresh=None):
+    refresh_tag=f'<meta http-equiv="refresh" content="{int(refresh)}">' if refresh else ''
+    return f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">{refresh_tag}<title>{html.escape(title)}</title>
+<style>
+:root{{--bg:#09111f;--panel:#111c2d;--panel2:#17243a;--text:#edf4ff;--muted:#94a6be;--line:#2a3b54;--blue:#63b3ff;--green:#55d98b;--amber:#ffc857;--red:#ff6b6b}}
+*{{box-sizing:border-box}}body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;background:var(--bg);color:var(--text);line-height:1.4}}
+main{{max-width:1400px;margin:auto;padding:1rem}}header{{display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap;margin-bottom:1rem}}
+h1,h2,h3{{margin:.15rem 0}}h1{{font-size:clamp(1.6rem,4vw,2.5rem)}}h2{{font-size:1.05rem;color:#d9e8fa}}a{{color:var(--blue)}}.muted{{color:var(--muted)}}
+.badge{{display:inline-flex;align-items:center;gap:.4rem;padding:.35rem .7rem;border-radius:999px;background:#21324b;color:var(--muted)}}.badge.live{{background:#123c2b;color:var(--green)}}.dot{{width:.55rem;height:.55rem;border-radius:50%;background:currentColor}}
+.actions{{display:flex;gap:.5rem;flex-wrap:wrap}}form{{margin:0}}button,.button{{border:0;border-radius:.55rem;padding:.7rem 1rem;background:var(--blue);color:#05101d;font-weight:700;text-decoration:none;cursor:pointer}}button.stop{{background:var(--red)}}.button.secondary{{background:#263954;color:var(--text)}}
+.grid{{display:grid;grid-template-columns:repeat(12,1fr);gap:.8rem}}.card{{grid-column:span 4;background:linear-gradient(145deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:.8rem;padding:1rem;min-width:0}}.wide{{grid-column:span 8}}.full{{grid-column:1/-1}}
+.metrics{{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:.55rem;margin-top:.7rem}}.metric{{background:#0b1627;border:1px solid #22334d;border-radius:.6rem;padding:.65rem}}.metric span{{display:block;color:var(--muted);font-size:.78rem}}.metric strong{{display:block;font-size:1.15rem;margin-top:.15rem;overflow-wrap:anywhere}}.metric.good strong{{color:var(--green)}}.metric.warn strong{{color:var(--amber)}}.metric.bad strong{{color:var(--red)}}
+.table-wrap{{overflow:auto;margin-top:.6rem}}table{{border-collapse:collapse;width:100%;font-size:.88rem}}th,td{{text-align:left;border-bottom:1px solid var(--line);padding:.5rem;white-space:nowrap}}th{{color:var(--muted);font-weight:600}}
+.gallery{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.65rem;margin-top:.7rem}}.photo{{position:relative;display:block;min-height:130px;border-radius:.6rem;overflow:hidden;background:#050a12}}.photo img{{width:100%;height:180px;object-fit:cover;display:block}}.photo span{{position:absolute;bottom:0;left:0;right:0;padding:.35rem .5rem;background:#000a;color:#fff;font-size:.72rem}}
+.errors{{margin:.6rem 0 0;padding-left:1.2rem;color:#ffb6b6}}pre{{background:#07101d;border:1px solid var(--line);padding:.7rem;border-radius:.5rem;white-space:pre-wrap;overflow-wrap:anywhere;color:#bdd0e8}}
+@media(max-width:900px){{.card,.wide{{grid-column:1/-1}}}}@media(max-width:520px){{main{{padding:.7rem}}.photo img{{height:145px}}}}
+</style></head><body><main>{body}</main></body></html>'''
+
+def latest_row(db, table):
+    try:
+        row=db.execute(f'select * from {table} order by ts desc limit 1').fetchone()
+        return dict(row) if row else {}
+    except sqlite3.OperationalError:
+        return {}
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): print('WEB', fmt%args, flush=True)
@@ -661,35 +803,68 @@ class Handler(BaseHTTPRequestHandler):
         u=urlparse(self.path); path=u.path
         if path.startswith('/ride/') and '/photos/' in path:
             parts=path.split('/')
-            rid=parts[2]; fname='/'.join(parts[4:])
+            rid=parts[2]; fname=parts[-1]
+            if not re.fullmatch(r'[A-Za-z0-9_.-]+',rid) or Path(fname).name != fname:
+                self.send('not found','text/plain',404); return
             fp=RIDES_DIR/rid/'photos'/fname
-            if fp.exists(): self.send(fp.read_bytes(),'image/jpeg'); return
+            if fp.is_file(): self.send(fp.read_bytes(),'image/jpeg'); return
             self.send('not found','text/plain',404); return
         if path.startswith('/ride/'):
-            rid=path.split('/')[2]; d=RIDES_DIR/rid; dbp=d/'ride.sqlite'
+            rid=path.split('/')[2]
+            if not re.fullmatch(r'[A-Za-z0-9_.-]+',rid):
+                self.send('ride not found','text/plain',404); return
+            d=RIDES_DIR/rid; dbp=d/'ride.sqlite'
             if not dbp.exists(): self.send('ride not found','text/plain',404); return
             db=sqlite3.connect(str(dbp)); db.row_factory=sqlite3.Row
             counts={}
             for t in ('gps','environment','imu','ups','wifi','bluetooth','camera','health','events'):
                 try: counts[t]=db.execute(f'select count(*) from {t}').fetchone()[0]
                 except Exception: counts[t]=0
-            latest_gps=db.execute('select * from gps where lat is not null and lon is not null order by ts desc limit 1').fetchone()
-            cams=db.execute('select * from camera order by ts desc limit 30').fetchall(); events=db.execute('select * from events order by ts desc limit 30').fetchall(); db.close()
-            imgs=''.join(f'<a href="/ride/{rid}/photos/{html.escape(Path(r["file"]).name)}"><img src="/ride/{rid}/photos/{html.escape(Path(r["file"]).name)}"></a>' for r in cams if r['file'])
-            gpshtml=f'<p>Latest GPS: {latest_gps["lat"]}, {latest_gps["lon"]}</p>' if latest_gps else '<p>No GPS fix yet.</p>'
-            body=f'<p><a href="/">Home</a></p><div class="card"><h2>{html.escape(rid)}</h2>{gpshtml}<pre>{html.escape(json.dumps(counts,indent=2))}</pre></div><h2>Photos</h2>{imgs or "No photos."}<h2>Recent events</h2><pre>{html.escape(json.dumps([dict(e) for e in events], indent=2))}</pre>'
-            self.send(page('Ride '+rid, body)); return
+            latest={table:latest_row(db,table) for table in ('gps','environment','imu','ups','health')}
+            bluetooth=[dict(row) for row in db.execute('select * from bluetooth order by ts desc limit 20').fetchall()]
+            events=[dict(row) for row in db.execute('select * from events order by ts desc limit 20').fetchall()]
+            db.close()
+            gps=latest['gps']; env=latest['environment']; ups=latest['ups']; health=latest['health']
+            body=f'''<header><div><a href="/">← Dashboard</a><h1>Ride {html.escape(rid)}</h1></div></header>
+<div class="grid">
+<section class="card">{metric("GPS",f'{display_value(gps.get("lat"),6)}, {display_value(gps.get("lon"),6)}')}{metric("Speed",display_value(gps.get("speed_knots"),1," kn"))}{metric("Satellites",display_value(gps.get("sats")))}</section>
+<section class="card">{metric("Temperature",display_value(env.get("temperature_c"),1," °C"))}{metric("Humidity",display_value(env.get("humidity_pct"),1," %"))}{metric("Pressure",display_value(env.get("pressure_hpa"),1," hPa"))}</section>
+<section class="card">{metric("Battery",display_value(ups.get("battery_percent"),1," %"))}{metric("Voltage",display_value(ups.get("bus_voltage_v"),2," V"))}{metric("Current",display_value(ups.get("current_ma"),0," mA"))}</section>
+<section class="card full"><h2>Latest photos</h2>{photo_gallery(latest_photos(12,rid))}</section>
+<section class="card wide"><h2>Bluetooth observations</h2>{data_table(bluetooth,[("ts","Time"),("name","Name"),("address","Address"),("address_type","Type"),("rssi_dbm","RSSI dBm")])}</section>
+<section class="card"><h2>Ride totals</h2><pre>{html.escape(json.dumps(counts,indent=2))}</pre></section>
+<section class="card full"><h2>Recent events</h2>{data_table(events,[("ts","Time"),("type","Type"),("message","Message")])}</section>
+</div>'''
+            self.send(page('Ride '+rid,body)); return
         if path=='/status.json':
             with STATE.lock:
-                obj={'ride_id':STATE.ride_id,'started_at':STATE.started_at,'last_gps':STATE.last_gps,'last_env':STATE.last_env,'last_imu':STATE.last_imu,'last_ups':STATE.last_ups,'last_health':STATE.last_health,'last_camera':STATE.last_camera,'camera_status':STATE.camera_status,'last_wifi_count':STATE.last_wifi_count,'last_bluetooth_count':STATE.last_bluetooth_count,'errors':STATE.errors[-10:], 'rides_dir':str(RIDES_DIR)}
+                obj={'ride_id':STATE.ride_id,'started_at':STATE.started_at,'last_gps':STATE.last_gps,'last_env':STATE.last_env,'last_imu':STATE.last_imu,'last_ups':STATE.last_ups,'last_health':STATE.last_health,'last_camera':STATE.last_camera,'camera_status':STATE.camera_status,'last_wifi_count':STATE.last_wifi_count,'last_wifi_devices':STATE.last_wifi_devices,'last_bluetooth_count':STATE.last_bluetooth_count,'last_bluetooth_devices':STATE.last_bluetooth_devices,'bluetooth_status':STATE.bluetooth_status,'errors':STATE.errors[-10:], 'rides_dir':str(RIDES_DIR)}
             self.send(json.dumps(obj,indent=2,default=str),'application/json'); return
         rides=list_rides()
         with STATE.lock:
-            status={'ride_id':STATE.ride_id,'started_at':STATE.started_at,'gps':STATE.last_gps,'env':STATE.last_env,'imu':STATE.last_imu,'ups':STATE.last_ups,'health':STATE.last_health,'camera':STATE.camera_status,'wifi_count':STATE.last_wifi_count,'bluetooth_count':STATE.last_bluetooth_count,'errors':STATE.errors[-5:]}
-        controls='<form method="post" action="/api/start"><button>Start ride</button></form><form method="post" action="/api/stop"><button>Stop ride</button></form>'
-        cards=''.join(f'<div class="card"><h2><a href="/ride/{html.escape(r["id"])}">{html.escape(r["id"])}</a></h2><pre>{html.escape(json.dumps(r,indent=2))}</pre></div>' for r in rides)
-        body=f'{controls}<p><a href="/status.json">status.json</a></p><div class="card"><h2>Current status</h2><pre>{html.escape(json.dumps(status,indent=2,default=str))}</pre></div><h2>Historic rides</h2>{cards or "No rides yet."}'
-        self.send(page('BikeLogger RideHub', body))
+            status={'ride_id':STATE.ride_id,'started_at':STATE.started_at,'gps':STATE.last_gps.copy(),'env':STATE.last_env.copy(),'imu':STATE.last_imu.copy(),'ups':STATE.last_ups.copy(),'health':STATE.last_health.copy(),'camera':STATE.camera_status,'camera_data':STATE.last_camera.copy(),'wifi_count':STATE.last_wifi_count,'wifi_devices':list(STATE.last_wifi_devices),'bluetooth_count':STATE.last_bluetooth_count,'bluetooth_devices':list(STATE.last_bluetooth_devices),'bluetooth_status':STATE.bluetooth_status.copy(),'errors':STATE.errors[-8:]}
+        env=next(iter(status['env'].values()),{}) if status['env'] else {}
+        gps=status['gps']; imu=status['imu']; ups=status['ups']; health=status['health']; bt=status['bluetooth_status']
+        ride_live=bool(status['ride_id'])
+        controls='<div class="actions"><form method="post" action="/api/start"><button>Start ride</button></form><form method="post" action="/api/stop"><button class="stop">Stop ride</button></form><a class="button secondary" href="/status.json">Raw status</a></div>'
+        ride_rows=[{'id':r.get('id'),'started_at':r.get('started_at'),'stopped_at':r.get('stopped_at'),'gps':r.get('gps',0),'photos':r.get('photos',0),'bluetooth':r.get('bluetooth',0)} for r in rides[:12]]
+        camera=status['camera_data']
+        bt_detail=bt.get('error') or '; '.join(bt.get('errors',[]))
+        errors=''.join(f'<li>{html.escape(error)}</li>' for error in status['errors'])
+        body=f'''<header><div><h1>BikeLogger RideHub</h1><div class="badge {"live" if ride_live else ""}"><span class="dot"></span>{"Recording "+html.escape(status["ride_id"]) if ride_live else "Ready, not recording"}</div></div>{controls}</header>
+<div class="grid">
+<section class="card"><h2>GPS</h2><div class="metrics">{metric("Latitude",display_value(gps.get("lat"),6))}{metric("Longitude",display_value(gps.get("lon"),6))}{metric("Speed",display_value(gps.get("speed_knots"),1," kn"))}{metric("Course",display_value(gps.get("course_deg"),1," °"))}{metric("Altitude",display_value(gps.get("alt_m"),1," m"))}{metric("Fix quality",display_value(gps.get("fix_quality")))}{metric("Satellites",display_value(gps.get("sats")))}{metric("HDOP",display_value(gps.get("hdop"),2))}</div></section>
+<section class="card"><h2>Environment</h2><div class="metrics">{metric("Temperature",display_value(env.get("temperature_c"),1," °C"))}{metric("Humidity",display_value(env.get("humidity_pct"),1," %"))}{metric("Pressure",display_value(env.get("pressure_hpa"),1," hPa"))}</div></section>
+<section class="card"><h2>UPS battery</h2><div class="metrics">{metric("Charge",display_value(ups.get("battery_percent"),1," %"),"good" if ups.get("battery_percent",0)>40 else "warn")}{metric("Bus voltage",display_value(ups.get("bus_voltage_v"),2," V"))}{metric("Supply voltage",display_value(ups.get("supply_voltage_v"),2," V"))}{metric("Shunt",display_value(ups.get("shunt_voltage_mv"),2," mV"))}{metric("Current",display_value(ups.get("current_ma"),0," mA"))}{metric("Power",display_value(ups.get("power_w"),2," W"))}{metric("State",display_value(ups.get("state")))}</div></section>
+<section class="card wide"><h2>Motion / IMU</h2><div class="metrics">{metric("Accel X",display_value(imu.get("accel_x_g"),3," g"))}{metric("Accel Y",display_value(imu.get("accel_y_g"),3," g"))}{metric("Accel Z",display_value(imu.get("accel_z_g"),3," g"))}{metric("Gyro X",display_value(imu.get("gyro_x_dps"),1," °/s"))}{metric("Gyro Y",display_value(imu.get("gyro_y_dps"),1," °/s"))}{metric("Gyro Z",display_value(imu.get("gyro_z_dps"),1," °/s"))}{metric("Mag X",display_value(imu.get("mag_x_gauss"),3," G"))}{metric("Mag Y",display_value(imu.get("mag_y_gauss"),3," G"))}{metric("Mag Z",display_value(imu.get("mag_z_gauss"),3," G"))}</div></section>
+<section class="card"><h2>System / camera</h2><div class="metrics">{metric("CPU",display_value(health.get("cpu_temp_c"),1," °C"))}{metric("Load",display_value(health.get("load1"),2))}{metric("Memory free",display_value(health.get("mem_available_kb"),0," kB"))}{metric("Disk free",display_value(health.get("disk_free_mb"),0," MB"))}{metric("Throttle",display_value(health.get("throttled")))}{metric("Camera",status["camera"])}{metric("Last capture",display_value(camera.get("captured_at")))}</div></section>
+<section class="card full"><h2>Latest photos</h2>{photo_gallery(latest_photos(8))}</section>
+<section class="card wide"><h2>Bluetooth devices</h2><p class="muted">Scan: {html.escape(display_value(bt.get("state")))} · {html.escape(display_value(bt.get("finished_at")))} · {status["bluetooth_count"]} devices{(" · "+html.escape(bt_detail)) if bt_detail else ""}</p>{data_table(status["bluetooth_devices"],[("name","Name"),("address","Address"),("address_type","Type"),("rssi_dbm","RSSI dBm")],"No Bluetooth devices reported by the last scan.")}</section>
+<section class="card"><h2>Nearby WiFi</h2><p class="muted">{status["wifi_count"]} networks in the last scan</p>{data_table(status["wifi_devices"][:8],[("ssid","SSID"),("signal_dbm","dBm")],"No WiFi networks reported.")}</section>
+<section class="card full"><h2>Ride history</h2>{ride_history_table(ride_rows)}</section>
+<section class="card full"><h2>Recent errors</h2>{"<ul class=errors>"+errors+"</ul>" if errors else '<p class="muted">No recent errors.</p>'}</section>
+</div><p class="muted">Dashboard refreshes every 5 seconds.</p>'''
+        self.send(page('BikeLogger RideHub',body,refresh=5))
 
 def main():
     def handle(sig, frame):

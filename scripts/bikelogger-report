@@ -17,7 +17,7 @@ OUT=/tmp/bikelogger_setup_report_$(date +%Y%m%d_%H%M%S).txt
   echo "=== SERIAL ==="; ls -l /dev/serial* /dev/ttyAMA* /dev/ttyS* 2>/dev/null || true
   echo "=== GPS SAMPLE 5s ==="; timeout 5 cat /dev/serial0 2>/dev/null | head -10 || true
   echo "=== WIFI ==="; iw dev 2>/dev/null || true
-  echo "=== BLUETOOTH ==="; rfkill list bluetooth 2>/dev/null || true; hciconfig -a 2>/dev/null || true; bluetoothctl show 2>/dev/null || true; echo "--- 12s btmgmt sample ---"; rfkill unblock bluetooth 2>/dev/null || true; btmgmt --index 0 power on 2>/dev/null || true; timeout 12 btmgmt --index 0 find 2>&1 | head -80 || true
+  echo "=== BLUETOOTH ==="; rfkill list bluetooth 2>/dev/null || true; hciconfig -a 2>/dev/null || true; bluetoothctl show 2>/dev/null || true; echo "--- 12s btmgmt sample ---"; rfkill unblock bluetooth 2>/dev/null || true; btmgmt --index 0 power on 2>/dev/null || true; timeout 12 stdbuf -oL -eL btmgmt --index 0 find 2>&1 | head -80 || true
   echo "=== DISK/RIDES ==="; df -h / /var/lib/bikelogger 2>/dev/null || true; find /var/lib/bikelogger/rides -maxdepth 3 -type f | tail -80 || true
   echo "=== RELATED SERVICES ==="; systemctl list-unit-files --type=service --no-legend | grep -Ei 'bike|ride|hub|camera|gps|logger' || true
   echo "=== JOURNAL ==="; journalctl -u bikelogger.service -n 220 --no-pager || true
