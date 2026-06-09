@@ -8,7 +8,7 @@ db="ride.sqlite"
 [[ -f ride.db && ! -f ride.sqlite ]] && db=ride.db
 if [[ ! -f "$db" ]]; then echo "No ride database in $latest"; exit 1; fi
 mkdir -p exports
-for t in gps environment wifi bluetooth camera health events meta; do
+for t in gps environment imu wifi bluetooth camera health events meta; do
   sqlite3 -header -csv "$db" "select * from $t;" > "exports/$t.csv" 2>/dev/null || true
 done
 echo "Exported CSV files to $latest/exports"

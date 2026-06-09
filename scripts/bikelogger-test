@@ -27,6 +27,7 @@ report['http_status']=run(['bash','-lc','curl -s http://127.0.0.1:8080/status.js
 report['python_imports']={m:check_import(m) for m in ['flask','serial','gpiozero','smbus','picamera2']}
 report['camera_list']=run(['bash','-lc','libcamera-hello --list-cameras 2>&1 | head -80'], timeout=10)
 report['i2c_detect']=run(['bash','-lc','i2cdetect -y 1 2>/dev/null || true'])
+report['imu_addresses']=run(['bash','-lc','i2cdetect -y 1 2>/dev/null | grep -E "1e|19|6a|6b" || true'])
 report['serial_devices']=run(['bash','-lc','ls -l /dev/serial* /dev/ttyAMA* /dev/ttyS* 2>/dev/null || true'])
 report['gps_sample']=run(['bash','-lc','timeout 5 cat /dev/serial0 2>/dev/null | head -5 || true'], timeout=8)
 report['wifi_ifaces']=run(['bash','-lc','iw dev 2>/dev/null || ip link show'])

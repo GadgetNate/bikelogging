@@ -8,6 +8,7 @@ Current target hardware:
 - Raspberry Pi Camera Module 3 / IMX708 using Picamera2/libcamera
 - Serial GPS on `/dev/serial0` at 38400 baud
 - BME280/BMP280 on I2C bus 1, address `0x76` or `0x77`
+- Pololu MiniIMU-9 v2 on I2C bus 1 (`0x19`, `0x1e`, and `0x6a` or `0x6b`)
 - Start button on GPIO27
 - Stop button on GPIO17
 - Built-in WiFi scanning
@@ -141,6 +142,12 @@ i2cdetect -y 1
 ```
 
 Expected BME280/BMP280 address: `0x76` or `0x77`.
+
+Expected MiniIMU-9 v2 addresses:
+
+- LSM303DLHC accelerometer: `0x19`
+- LSM303DLHC magnetometer: `0x1e`
+- L3GD20 gyroscope: `0x6a` or `0x6b`
 
 Serial GPS:
 

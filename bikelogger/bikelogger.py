@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """BikeLogger Pi 4: lightweight ride logger + RideHub web UI.
-Features: GPIO start/stop, serial GPS NMEA at 38400, BME280, persistent Picamera2 autofocus capture,
+Features: GPIO start/stop, serial GPS NMEA at 38400, BME280, Pololu MiniIMU-9 v2,
+persistent Picamera2 autofocus capture,
 plain-text WiFi scans, built-in Bluetooth device/RSSI scans, health logging, per-ride SQLite, local web history browser.
 """
 import os, sys, time, json, math, glob, sqlite3, threading, subprocess, shutil, signal, html, re
@@ -12,7 +13,7 @@ from urllib.parse import urlparse, parse_qs
 APP_DIR = Path('/opt/bikelogger')
 DATA_DIR = Path(os.environ.get('BIKELOGGER_DATA', '/var/lib/bikelogger'))
 RIDES_DIR = DATA_DIR / 'rides'
-LOG_DIR = Path('/var/log/bikelogger')
+LOG_DIR = Path(os.environ.get('BIKELOGGER_LOG', '/var/log/bikelogger'))
 CONFIG_PATH = APP_DIR / 'config.json'
 RUNNING = True
 
@@ -33,6 +34,9 @@ def load_config():
         'start_button_gpio': 27, 'stop_button_gpio': 17,
         'button_bounce_sec': 0.15,
         'i2c_bus': 1, 'bme280_addresses': [0x76, 0x77],
+        'imu_interval_sec': 0.1,
+        'imu_accel_address': 0x19, 'imu_mag_address': 0x1E,
+        'imu_gyro_addresses': [0x6B, 0x6A],
         'capture_when_idle': False,
         'log_plain_wifi_ssid': True,
         'log_bluetooth_names': True,
@@ -59,6 +63,7 @@ class State:
         self.started_at = None
         self.last_gps = {}
         self.last_env = {}
+        self.last_imu = {}
         self.last_health = {}
         self.last_camera = {}
         self.last_wifi_count = 0
@@ -91,6 +96,7 @@ def init_db(path):
         '''create table if not exists events(ts text, type text, message text, data_json text)''',
         '''create table if not exists gps(ts text, lat real, lon real, alt_m real, speed_knots real, course_deg real, fix_quality integer, sats integer, hdop real, raw text)''',
         '''create table if not exists environment(ts text, sensor text, temperature_c real, humidity_pct real, pressure_hpa real, data_json text)''',
+        '''create table if not exists imu(ts text, accel_x_raw integer, accel_y_raw integer, accel_z_raw integer, accel_x_g real, accel_y_g real, accel_z_g real, gyro_x_raw integer, gyro_y_raw integer, gyro_z_raw integer, gyro_x_dps real, gyro_y_dps real, gyro_z_dps real, mag_x_raw integer, mag_y_raw integer, mag_z_raw integer, mag_x_gauss real, mag_y_gauss real, mag_z_gauss real, data_json text)''',
         '''create table if not exists wifi(ts text, iface text, bssid text, ssid text, signal_dbm real, freq_mhz integer, channel integer, data_json text)''',
         '''create table if not exists bluetooth(ts text, adapter text, address text, address_type text, name text, rssi_dbm real, flags text, data_json text)''',
         '''create table if not exists camera(ts text, file text, width integer, height integer, status text, data_json text)''',
@@ -251,6 +257,102 @@ class EnvWorker(threading.Thread):
                     if STATE.db: db_exec('insert into environment values(?,?,?,?,?,?)',(ts,name,t,h,p,json.dumps(data)))
                 except Exception as e: STATE.add_error(f'{name}: {e}')
             time.sleep(float(CONFIG['env_interval_sec']))
+
+def signed_16(lo, hi):
+    value=(hi << 8) | lo
+    return value-65536 if value > 32767 else value
+
+def signed_16_be(hi, lo):
+    return signed_16(lo, hi)
+
+class MiniIMU9V2:
+    ACCEL_SCALE_G = 0.001
+    GYRO_SCALE_DPS = 0.00875
+    MAG_XY_SCALE_GAUSS = 1.0 / 1100.0
+    MAG_Z_SCALE_GAUSS = 1.0 / 980.0
+
+    def __init__(self, bus, accel_addr, mag_addr, gyro_addresses):
+        self.bus = bus
+        self.accel_addr = accel_addr
+        self.mag_addr = mag_addr
+        self.gyro_addr = None
+        for addr in gyro_addresses:
+            try:
+                if bus.read_byte_data(addr, 0x0F) == 0xD4:
+                    self.gyro_addr = addr
+                    break
+            except Exception:
+                pass
+        if self.gyro_addr is None:
+            raise RuntimeError('L3GD20 not found at configured addresses')
+
+        bus.write_byte_data(self.accel_addr, 0x20, 0x57)
+        bus.write_byte_data(self.accel_addr, 0x23, 0x88)
+        bus.write_byte_data(self.gyro_addr, 0x20, 0x0F)
+        bus.write_byte_data(self.gyro_addr, 0x23, 0x80)
+        bus.write_byte_data(self.mag_addr, 0x00, 0x14)
+        bus.write_byte_data(self.mag_addr, 0x01, 0x20)
+        bus.write_byte_data(self.mag_addr, 0x02, 0x00)
+
+    def read(self):
+        accel=self.bus.read_i2c_block_data(self.accel_addr, 0x28 | 0x80, 6)
+        gyro=self.bus.read_i2c_block_data(self.gyro_addr, 0x28 | 0x80, 6)
+        mag=self.bus.read_i2c_block_data(self.mag_addr, 0x03, 6)
+
+        ax=signed_16(accel[0], accel[1]) >> 4
+        ay=signed_16(accel[2], accel[3]) >> 4
+        az=signed_16(accel[4], accel[5]) >> 4
+        gx=signed_16(gyro[0], gyro[1])
+        gy=signed_16(gyro[2], gyro[3])
+        gz=signed_16(gyro[4], gyro[5])
+        mx=signed_16_be(mag[0], mag[1])
+        mz=signed_16_be(mag[2], mag[3])
+        my=signed_16_be(mag[4], mag[5])
+
+        return {
+            'accel_x_raw':ax, 'accel_y_raw':ay, 'accel_z_raw':az,
+            'accel_x_g':ax*self.ACCEL_SCALE_G, 'accel_y_g':ay*self.ACCEL_SCALE_G, 'accel_z_g':az*self.ACCEL_SCALE_G,
+            'gyro_x_raw':gx, 'gyro_y_raw':gy, 'gyro_z_raw':gz,
+            'gyro_x_dps':gx*self.GYRO_SCALE_DPS, 'gyro_y_dps':gy*self.GYRO_SCALE_DPS, 'gyro_z_dps':gz*self.GYRO_SCALE_DPS,
+            'mag_x_raw':mx, 'mag_y_raw':my, 'mag_z_raw':mz,
+            'mag_x_gauss':mx*self.MAG_XY_SCALE_GAUSS, 'mag_y_gauss':my*self.MAG_XY_SCALE_GAUSS, 'mag_z_gauss':mz*self.MAG_Z_SCALE_GAUSS
+        }
+
+class IMUWorker(threading.Thread):
+    daemon=True
+    def run(self):
+        try:
+            try: import smbus
+            except Exception: import smbus2 as smbus
+            bus=smbus.SMBus(int(CONFIG['i2c_bus']))
+            sensor=MiniIMU9V2(
+                bus,
+                int(CONFIG['imu_accel_address']),
+                int(CONFIG['imu_mag_address']),
+                [int(addr) for addr in CONFIG['imu_gyro_addresses']]
+            )
+            print(f'MiniIMU-9 v2 ready: accel 0x{sensor.accel_addr:02x}, mag 0x{sensor.mag_addr:02x}, gyro 0x{sensor.gyro_addr:02x}', flush=True)
+        except Exception as e:
+            STATE.add_error(f'MiniIMU-9 v2 init: {e}'); return
+        while RUNNING:
+            try:
+                data=sensor.read(); ts=now_iso()
+                with STATE.lock: STATE.last_imu=data
+                if STATE.db:
+                    db_exec(
+                        'insert into imu values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                        (ts,
+                         data['accel_x_raw'],data['accel_y_raw'],data['accel_z_raw'],
+                         data['accel_x_g'],data['accel_y_g'],data['accel_z_g'],
+                         data['gyro_x_raw'],data['gyro_y_raw'],data['gyro_z_raw'],
+                         data['gyro_x_dps'],data['gyro_y_dps'],data['gyro_z_dps'],
+                         data['mag_x_raw'],data['mag_y_raw'],data['mag_z_raw'],
+                         data['mag_x_gauss'],data['mag_y_gauss'],data['mag_z_gauss'],
+                         json.dumps(data))
+                    )
+            except Exception as e:
+                STATE.add_error(f'MiniIMU-9 v2 read: {e}')
+            time.sleep(max(0.02, float(CONFIG['imu_interval_sec'])))
 
 class CameraWorker(threading.Thread):
     daemon=True
@@ -451,8 +553,9 @@ def list_rides():
                 db=sqlite3.connect(str(dbp));
                 meta=dict(db.execute('select key,value from meta').fetchall())
                 info.update({k:meta.get(k,'') for k in ('started_at','stopped_at')})
-                for table in ('gps','environment','wifi','bluetooth','camera','health','events'):
-                    info[table]=db.execute(f'select count(*) from {table}').fetchone()[0]
+                for table in ('gps','environment','imu','wifi','bluetooth','camera','health','events'):
+                    try: info[table]=db.execute(f'select count(*) from {table}').fetchone()[0]
+                    except sqlite3.OperationalError: info[table]=0
                 db.close()
             except Exception as e: info['error']=str(e)
         rides.append(info)
@@ -485,7 +588,7 @@ class Handler(BaseHTTPRequestHandler):
             if not dbp.exists(): self.send('ride not found','text/plain',404); return
             db=sqlite3.connect(str(dbp)); db.row_factory=sqlite3.Row
             counts={}
-            for t in ('gps','environment','wifi','bluetooth','camera','health','events'):
+            for t in ('gps','environment','imu','wifi','bluetooth','camera','health','events'):
                 try: counts[t]=db.execute(f'select count(*) from {t}').fetchone()[0]
                 except Exception: counts[t]=0
             latest_gps=db.execute('select * from gps where lat is not null and lon is not null order by ts desc limit 1').fetchone()
@@ -496,11 +599,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send(page('Ride '+rid, body)); return
         if path=='/status.json':
             with STATE.lock:
-                obj={'ride_id':STATE.ride_id,'started_at':STATE.started_at,'last_gps':STATE.last_gps,'last_env':STATE.last_env,'last_health':STATE.last_health,'last_camera':STATE.last_camera,'camera_status':STATE.camera_status,'last_wifi_count':STATE.last_wifi_count,'last_bluetooth_count':STATE.last_bluetooth_count,'errors':STATE.errors[-10:], 'rides_dir':str(RIDES_DIR)}
+                obj={'ride_id':STATE.ride_id,'started_at':STATE.started_at,'last_gps':STATE.last_gps,'last_env':STATE.last_env,'last_imu':STATE.last_imu,'last_health':STATE.last_health,'last_camera':STATE.last_camera,'camera_status':STATE.camera_status,'last_wifi_count':STATE.last_wifi_count,'last_bluetooth_count':STATE.last_bluetooth_count,'errors':STATE.errors[-10:], 'rides_dir':str(RIDES_DIR)}
             self.send(json.dumps(obj,indent=2,default=str),'application/json'); return
         rides=list_rides()
         with STATE.lock:
-            status={'ride_id':STATE.ride_id,'started_at':STATE.started_at,'gps':STATE.last_gps,'env':STATE.last_env,'health':STATE.last_health,'camera':STATE.camera_status,'wifi_count':STATE.last_wifi_count,'bluetooth_count':STATE.last_bluetooth_count,'errors':STATE.errors[-5:]}
+            status={'ride_id':STATE.ride_id,'started_at':STATE.started_at,'gps':STATE.last_gps,'env':STATE.last_env,'imu':STATE.last_imu,'health':STATE.last_health,'camera':STATE.camera_status,'wifi_count':STATE.last_wifi_count,'bluetooth_count':STATE.last_bluetooth_count,'errors':STATE.errors[-5:]}
         controls='<form method="post" action="/api/start"><button>Start ride</button></form><form method="post" action="/api/stop"><button>Stop ride</button></form>'
         cards=''.join(f'<div class="card"><h2><a href="/ride/{html.escape(r["id"])}">{html.escape(r["id"])}</a></h2><pre>{html.escape(json.dumps(r,indent=2))}</pre></div>' for r in rides)
         body=f'{controls}<p><a href="/status.json">status.json</a></p><div class="card"><h2>Current status</h2><pre>{html.escape(json.dumps(status,indent=2,default=str))}</pre></div><h2>Historic rides</h2>{cards or "No rides yet."}'
@@ -512,7 +615,7 @@ def main():
         RUNNING=False; stop_ride(f'signal {sig}'); sys.exit(0)
     signal.signal(signal.SIGTERM, handle); signal.signal(signal.SIGINT, handle)
     print('BikeLogger starting', now_iso(), flush=True)
-    threads=[GPSWorker(), EnvWorker(), CameraWorker(), WiFiWorker(), BluetoothWorker(), HealthWorker(), ButtonWorker()]
+    threads=[GPSWorker(), EnvWorker(), IMUWorker(), CameraWorker(), WiFiWorker(), BluetoothWorker(), HealthWorker(), ButtonWorker()]
     for t in threads: t.start()
     host=CONFIG['web_host']; port=int(CONFIG['web_port'])
     print(f'RideHub web: http://{host}:{port}', flush=True)
