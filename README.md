@@ -138,6 +138,8 @@ RideHub shows the 20 strongest hotspots from the most recent WiFi scan,
 including SSID, BSSID, signal strength, channel, frequency, and interface.
 The header and footer show the deployed Git commit and installation timestamp.
 The same metadata is available under `version` in `/status.json`.
+The Start ride and Stop ride buttons use redirect-after-POST behavior, so the
+dashboard refreshes without displaying JSON or prompting to resubmit a form.
 
 ## Hardware checks
 

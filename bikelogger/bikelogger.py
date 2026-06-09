@@ -911,10 +911,22 @@ class Handler(BaseHTTPRequestHandler):
     def send(self, content, ctype='text/html', code=200):
         if isinstance(content,str): content=content.encode()
         self.send_response(code); self.send_header('Content-Type',ctype); self.send_header('Content-Length',str(len(content))); self.end_headers(); self.wfile.write(content)
+    def redirect(self, location='/'):
+        self.send_response(303)
+        self.send_header('Location',location)
+        self.send_header('Content-Length','0')
+        self.send_header('Cache-Control','no-store')
+        self.end_headers()
     def do_POST(self):
         path=urlparse(self.path).path
-        if path=='/api/start': rid=start_ride('web'); self.send(json.dumps({'ride_id':rid}), 'application/json'); return
-        if path=='/api/stop': rid=stop_ride('web'); self.send(json.dumps({'stopped':rid}), 'application/json'); return
+        if path=='/api/start':
+            start_ride('web')
+            self.redirect('/')
+            return
+        if path=='/api/stop':
+            stop_ride('web')
+            self.redirect('/')
+            return
         self.send('not found','text/plain',404)
     def do_GET(self):
         u=urlparse(self.path); path=u.path

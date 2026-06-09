@@ -264,6 +264,28 @@ def test_load_version_file(tmp_path=None):
         mod.VERSION_PATH = original
         path.unlink(missing_ok=True)
 
+def test_handler_redirect_uses_see_other():
+    class FakeHandler:
+        def __init__(self):
+            self.code = None
+            self.headers = []
+            self.ended = False
+        def send_response(self, code):
+            self.code = code
+        def send_header(self, name, value):
+            self.headers.append((name,value))
+        def end_headers(self):
+            self.ended = True
+
+    handler = FakeHandler()
+    mod.Handler.redirect(handler,'/')
+
+    assert handler.code == 303
+    assert ('Location','/') in handler.headers
+    assert ('Content-Length','0') in handler.headers
+    assert ('Cache-Control','no-store') in handler.headers
+    assert handler.ended
+
 def test_camera_transform_options():
     assert mod.camera_transform_options(0) == {'hflip':0,'vflip':0}
     assert mod.camera_transform_options(180) == {'hflip':1,'vflip':1}
