@@ -1,0 +1,8 @@
+[project]
+name = "bikelogger"
+version = "0.1.0"
+description = "Raspberry Pi BikeLogger ride logger and RideHub web UI"
+requires-python = ">=3.9"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

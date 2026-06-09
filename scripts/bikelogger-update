@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+REPO_DIR="${BIKELOGGER_REPO:-}"
+if [[ -z "$REPO_DIR" && -f /opt/bikelogger/.repo_path ]]; then
+  REPO_DIR="$(cat /opt/bikelogger/.repo_path)"
+fi
+if [[ -z "$REPO_DIR" ]]; then
+  echo "No repo path found. Set BIKELOGGER_REPO=/path/to/repo or reinstall once from a git clone."
+  exit 1
+fi
+cd "$REPO_DIR"
+echo "=== BikeLogger update ==="
+echo "Repo: $REPO_DIR"
+git status --short || true
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git fetch --all --prune
+  branch="$(git branch --show-current || true)"
+  [[ -n "$branch" ]] && git pull --ff-only origin "$branch"
+fi
+sudo bash ./install.sh

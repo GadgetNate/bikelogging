@@ -1,0 +1,20 @@
+[Unit]
+Description=BikeLogger Pi 4 ride logger and RideHub web UI
+After=network-online.target
+Wants=network-online.target
+Conflicts=gpsd.service gpsd.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/bikelogger/bikelogger.py
+WorkingDirectory=/opt/bikelogger
+Restart=always
+RestartSec=5
+User=root
+Group=root
+Environment=PYTHONUNBUFFERED=1
+Nice=5
+IOSchedulingClass=best-effort
+
+[Install]
+WantedBy=multi-user.target

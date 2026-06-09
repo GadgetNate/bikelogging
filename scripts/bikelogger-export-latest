@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+RIDES_DIR=${1:-/var/lib/bikelogger/rides}
+latest="$(find "$RIDES_DIR" -mindepth 1 -maxdepth 1 -type d | sort | tail -1)"
+if [[ -z "$latest" ]]; then echo "No ride folders in $RIDES_DIR"; exit 1; fi
+cd "$latest"
+db="ride.sqlite"
+[[ -f ride.db && ! -f ride.sqlite ]] && db=ride.db
+if [[ ! -f "$db" ]]; then echo "No ride database in $latest"; exit 1; fi
+mkdir -p exports
+for t in gps environment wifi bluetooth camera health events meta; do
+  sqlite3 -header -csv "$db" "select * from $t;" > "exports/$t.csv" 2>/dev/null || true
+done
+echo "Exported CSV files to $latest/exports"
+ls -lh exports

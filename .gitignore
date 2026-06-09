@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.DS_Store
+.env
+*.sqlite
+*.db
+*.jpg
+*.png
+exports/
+.vscode/*.log
