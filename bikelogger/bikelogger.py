@@ -516,16 +516,18 @@ def parse_iw_scan(text, iface):
     rows=[]
     current=None
     bssid_re=re.compile(r'^BSS\s+([0-9a-f]{2}(?::[0-9a-f]{2}){5})(?:\(|\s|$)', re.I)
+    def append_current():
+        if current:
+            current.setdefault('ssid','(hidden)')
+            rows.append(current)
     for raw in text.splitlines():
         line=raw.strip()
         match=bssid_re.match(line)
         if match:
-            if current:
-                rows.append(current)
+            append_current()
             current={'iface':iface,'bssid':match.group(1).lower()}
         elif line.startswith('BSS '):
-            if current:
-                rows.append(current)
+            append_current()
             current=None
         elif current and line.startswith('SSID:'):
             current['ssid']=line[5:].strip() or '(hidden)'
@@ -536,12 +538,11 @@ def parse_iw_scan(text, iface):
                 pass
         elif current and line.startswith('freq:'):
             try:
-                current['freq_mhz']=int(line.split()[1])
+                current['freq_mhz']=round(float(line.split()[1]))
                 current['channel']=wifi_channel(current['freq_mhz'])
             except (IndexError, ValueError):
                 pass
-    if current:
-        rows.append(current)
+    append_current()
     return rows
 
 def wifi_scan_once():

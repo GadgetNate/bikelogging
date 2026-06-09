@@ -85,7 +85,7 @@ def test_lsm303dlhc_logs_without_gyro():
 def test_parse_iw_scan_hotspots():
     text = '''
 BSS 30:57:8e:ef:7a:a3(on wlan0)
-        freq: 2412
+        freq: 2412.0
         signal: -47.00 dBm
         SSID: OurPlace
 BSS c8:c6:fe:27:c6:83(on wlan0)
