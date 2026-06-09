@@ -15,6 +15,7 @@ DATA_DIR = Path(os.environ.get('BIKELOGGER_DATA', '/var/lib/bikelogger'))
 RIDES_DIR = DATA_DIR / 'rides'
 LOG_DIR = Path(os.environ.get('BIKELOGGER_LOG', '/var/log/bikelogger'))
 CONFIG_PATH = APP_DIR / 'config.json'
+VERSION_PATH = APP_DIR / 'version.json'
 RUNNING = True
 
 def now_iso():
@@ -22,6 +23,16 @@ def now_iso():
 
 def utc_id():
     return datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
+
+def load_version():
+    try:
+        version=json.loads(VERSION_PATH.read_text())
+        return {
+            'commit':str(version.get('commit') or 'unknown'),
+            'installed_at':version.get('installed_at')
+        }
+    except Exception:
+        return {'commit':os.environ.get('BIKELOGGER_VERSION','development'),'installed_at':None}
 
 def load_config():
     default = {
@@ -53,6 +64,7 @@ def load_config():
     return default
 
 CONFIG = load_config()
+APP_VERSION = load_version()
 RIDES_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -943,7 +955,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send(page('Ride '+rid,body)); return
         if path=='/status.json':
             with STATE.lock:
-                obj={'ride_id':STATE.ride_id,'started_at':STATE.started_at,'last_gps':STATE.last_gps,'last_env':STATE.last_env,'last_imu':STATE.last_imu,'last_ups':STATE.last_ups,'last_health':STATE.last_health,'last_camera':STATE.last_camera,'camera_status':STATE.camera_status,'last_wifi_count':STATE.last_wifi_count,'last_wifi_scan_at':STATE.last_wifi_scan_at,'last_wifi_devices':STATE.last_wifi_devices,'last_bluetooth_count':STATE.last_bluetooth_count,'last_bluetooth_devices':STATE.last_bluetooth_devices,'bluetooth_status':STATE.bluetooth_status,'errors':STATE.errors[-10:], 'rides_dir':str(RIDES_DIR)}
+                obj={'version':APP_VERSION,'ride_id':STATE.ride_id,'started_at':STATE.started_at,'last_gps':STATE.last_gps,'last_env':STATE.last_env,'last_imu':STATE.last_imu,'last_ups':STATE.last_ups,'last_health':STATE.last_health,'last_camera':STATE.last_camera,'camera_status':STATE.camera_status,'last_wifi_count':STATE.last_wifi_count,'last_wifi_scan_at':STATE.last_wifi_scan_at,'last_wifi_devices':STATE.last_wifi_devices,'last_bluetooth_count':STATE.last_bluetooth_count,'last_bluetooth_devices':STATE.last_bluetooth_devices,'bluetooth_status':STATE.bluetooth_status,'errors':STATE.errors[-10:], 'rides_dir':str(RIDES_DIR)}
             self.send(json.dumps(obj,indent=2,default=str),'application/json'); return
         rides=list_rides()
         with STATE.lock:
@@ -956,7 +968,10 @@ class Handler(BaseHTTPRequestHandler):
         camera=status['camera_data']
         bt_detail=bt.get('error') or '; '.join(bt.get('errors',[]))
         errors=''.join(f'<li>{html.escape(error)}</li>' for error in status['errors'])
-        body=f'''<header><div><h1>BikeLogger RideHub</h1><div class="badge {"live" if ride_live else ""}"><span class="dot"></span>{"Recording "+html.escape(status["ride_id"]) if ride_live else "Ready, not recording"}</div></div>{controls}</header>
+        version_text=f'Version {APP_VERSION["commit"]}'
+        if APP_VERSION.get('installed_at'):
+            version_text+=f' · installed {APP_VERSION["installed_at"]}'
+        body=f'''<header><div><h1>BikeLogger RideHub</h1><div class="badge {"live" if ride_live else ""}"><span class="dot"></span>{"Recording "+html.escape(status["ride_id"]) if ride_live else "Ready, not recording"}</div><div class="muted">{html.escape(version_text)}</div></div>{controls}</header>
 <div class="grid">
 <section class="card"><h2>GPS</h2><div class="metrics">{metric("Latitude",display_value(gps.get("lat"),6))}{metric("Longitude",display_value(gps.get("lon"),6))}{metric("Speed",display_value(gps.get("speed_knots"),1," kn"))}{metric("Course",display_value(gps.get("course_deg"),1," °"))}{metric("Altitude",display_value(gps.get("alt_m"),1," m"))}{metric("Fix quality",display_value(gps.get("fix_quality")))}{metric("Satellites",display_value(gps.get("sats")))}{metric("HDOP",display_value(gps.get("hdop"),2))}</div></section>
 <section class="card"><h2>Environment</h2><div class="metrics">{metric("Temperature",display_value(env.get("temperature_c"),1," °C"))}{metric("Humidity",display_value(env.get("humidity_pct"),1," %"))}{metric("Pressure",display_value(env.get("pressure_hpa"),1," hPa"))}</div></section>
@@ -968,7 +983,7 @@ class Handler(BaseHTTPRequestHandler):
 <section class="card full"><h2>Most Recent WiFi Hotspots</h2><p class="muted">{status["wifi_count"]} networks · last scan {html.escape(display_value(status["wifi_scan_at"]))} · strongest signal first</p>{data_table(status["wifi_devices"],[("ssid","SSID"),("bssid","BSSID"),("signal_dbm","Signal dBm"),("channel","Channel"),("freq_mhz","Frequency MHz"),("iface","Interface")],"No WiFi hotspots reported by the last scan.")}</section>
 <section class="card full"><h2>Ride history</h2>{ride_history_table(ride_rows)}</section>
 <section class="card full"><h2>Recent errors</h2>{"<ul class=errors>"+errors+"</ul>" if errors else '<p class="muted">No recent errors.</p>'}</section>
-</div><p class="muted">Dashboard refreshes every 5 seconds.</p>'''
+</div><p class="muted">BikeLogger {html.escape(APP_VERSION["commit"])} · Dashboard refreshes every 5 seconds.</p>'''
         self.send(page('BikeLogger RideHub',body,refresh=5))
 
 def main():

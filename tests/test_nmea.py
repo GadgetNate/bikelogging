@@ -243,6 +243,27 @@ def test_dashboard_helpers_escape_content():
     assert '<script>' not in page
     assert 'content="5"' in page
 
+def test_load_version_fallback():
+    original = mod.VERSION_PATH
+    try:
+        mod.VERSION_PATH = Path('/tmp/bikelogger-version-does-not-exist.json')
+        os.environ['BIKELOGGER_VERSION'] = 'test-version'
+        assert mod.load_version() == {'commit':'test-version','installed_at':None}
+    finally:
+        mod.VERSION_PATH = original
+        os.environ.pop('BIKELOGGER_VERSION',None)
+
+def test_load_version_file(tmp_path=None):
+    path = Path('/tmp/bikelogger-test-version.json')
+    original = mod.VERSION_PATH
+    try:
+        path.write_text('{"commit":"abc123","installed_at":"2026-06-09T01:02:03Z"}')
+        mod.VERSION_PATH = path
+        assert mod.load_version() == {'commit':'abc123','installed_at':'2026-06-09T01:02:03Z'}
+    finally:
+        mod.VERSION_PATH = original
+        path.unlink(missing_ok=True)
+
 def test_camera_transform_options():
     assert mod.camera_transform_options(0) == {'hflip':0,'vflip':0}
     assert mod.camera_transform_options(180) == {'hflip':1,'vflip':1}

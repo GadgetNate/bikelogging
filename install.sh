@@ -41,6 +41,10 @@ fi
 
 mkdir -p "$APP_DIR" "$DATA_DIR/rides" /var/log/bikelogger
 install -m 0755 "$REPO_DIR/bikelogger/bikelogger.py" "$APP_DIR/bikelogger.py"
+VERSION_COMMIT="$(git -C "$REPO_DIR" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+VERSION_INSTALLED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+printf '{"commit":"%s","installed_at":"%s"}\n' "$VERSION_COMMIT" "$VERSION_INSTALLED_AT" > "$APP_DIR/version.json"
+chmod 0644 "$APP_DIR/version.json"
 if [[ ! -f "$APP_DIR/config.json" ]]; then
   install -m 0644 "$REPO_DIR/config/config.pi4.json" "$APP_DIR/config.json"
 else
@@ -60,6 +64,7 @@ systemctl enable bikelogger.service
 systemctl restart bikelogger.service
 
 echo "=== Installed ==="
+echo "Version: $VERSION_COMMIT"
 systemctl status bikelogger.service --no-pager -l || true
 echo "Web UI: http://$(hostname -I | awk '{print $1}'):8080/"
 echo "Test: sudo bikelogger-test"
