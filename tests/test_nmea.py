@@ -123,13 +123,13 @@ class FakeUPSHatBus:
         self.writes.append((addr, register, data))
 
     def read_i2c_block_data(self, addr, register, length):
-        assert addr == 0x42
+        assert addr in (0x42, 0x43)
         assert length == 2
         return self.registers[register]
 
 def test_waveshare_ups_hat_read_and_scale():
     bus = FakeUPSHatBus()
-    sensor = mod.WaveshareUPSHat(bus, 0x42, 6.0, 8.4)
+    sensor = mod.WaveshareUPSHat(bus, 0x42, 6.0, 8.4, 'B')
     data = sensor.read()
 
     assert (0x42, 0x05, [0x10, 0x00]) in bus.writes
@@ -142,9 +142,29 @@ def test_waveshare_ups_hat_read_and_scale():
     assert math.isclose(data['battery_percent'], 50.0)
     assert data['state'] == 'discharging'
 
+def test_waveshare_ups_hat_d_read_and_scale():
+    bus = FakeUPSHatBus()
+    sensor = mod.WaveshareUPSHat(bus, 0x43, 3.0, 4.2, 'D')
+    data = sensor.read()
+
+    assert (0x43, 0x05, [0x68, 0xF4]) in bus.writes
+    assert (0x43, 0x00, [0x0E, 0xEF]) in bus.writes
+    assert math.isclose(data['bus_voltage_v'], 7.2)
+    assert math.isclose(data['current_ma'], 762.0)
+    assert math.isclose(data['power_w'], 5.4864)
+    assert data['model'] == 'Waveshare UPS HAT (D)'
+    assert data['state'] == 'charging'
+
 def test_waveshare_ups_hat_rejects_invalid_voltage_range():
     try:
         mod.WaveshareUPSHat(FakeUPSHatBus(), 0x42, 8.4, 6.0)
+        assert False
+    except ValueError:
+        pass
+
+def test_waveshare_ups_hat_rejects_unknown_model():
+    try:
+        mod.WaveshareUPSHat(FakeUPSHatBus(), 0x43, 3.0, 4.2, 'Z')
         assert False
     except ValueError:
         pass

@@ -38,8 +38,8 @@ def load_config():
         'imu_interval_sec': 0.1,
         'imu_accel_address': 0x19, 'imu_mag_address': 0x1E,
         'imu_gyro_addresses': [0x6B, 0x6A],
-        'ups_interval_sec': 2.0, 'ups_address': 0x42,
-        'ups_empty_voltage': 6.0, 'ups_full_voltage': 8.4,
+        'ups_interval_sec': 2.0, 'ups_model': 'D', 'ups_address': 0x43,
+        'ups_empty_voltage': 3.0, 'ups_full_voltage': 4.2,
         'capture_when_idle': False,
         'log_plain_wifi_ssid': True,
         'log_bluetooth_names': True,
@@ -368,20 +368,32 @@ class IMUWorker(threading.Thread):
             time.sleep(max(0.02, float(CONFIG['imu_interval_sec'])))
 
 class WaveshareUPSHat:
-    CALIBRATION = 4096
-    CONFIG_32V_2A = 0x399F
-    CURRENT_LSB_MA = 0.1
-    POWER_LSB_W = 0.002
+    PROFILES = {
+        'B': {
+            'calibration':4096, 'config':0x399F,
+            'current_lsb_ma':0.1, 'power_lsb_w':0.002,
+            'reverse_current':False
+        },
+        'D': {
+            'calibration':26868, 'config':0x0EEF,
+            'current_lsb_ma':0.1524, 'power_lsb_w':0.003048,
+            'reverse_current':True
+        }
+    }
 
-    def __init__(self, bus, addr, empty_voltage, full_voltage):
+    def __init__(self, bus, addr, empty_voltage, full_voltage, model='D'):
         self.bus = bus
         self.addr = addr
         self.empty_voltage = empty_voltage
         self.full_voltage = full_voltage
+        self.model = str(model).upper()
+        if self.model not in self.PROFILES:
+            raise ValueError(f'Unsupported Waveshare UPS HAT model: {self.model}')
+        self.profile = self.PROFILES[self.model]
         if self.full_voltage <= self.empty_voltage:
             raise ValueError('UPS full voltage must be greater than empty voltage')
-        self.write_register(0x05, self.CALIBRATION)
-        self.write_register(0x00, self.CONFIG_32V_2A)
+        self.write_register(0x05, self.profile['calibration'])
+        self.write_register(0x00, self.profile['config'])
         self.read_register(0x02)
 
     def read_register(self, register):
@@ -392,7 +404,7 @@ class WaveshareUPSHat:
         self.bus.write_i2c_block_data(self.addr, register, [(value >> 8) & 0xFF, value & 0xFF])
 
     def read(self):
-        self.write_register(0x05, self.CALIBRATION)
+        self.write_register(0x05, self.profile['calibration'])
         shunt_raw=self.read_register(0x01)
         bus_raw=self.read_register(0x02)
         current_raw=self.read_register(0x04)
@@ -401,13 +413,15 @@ class WaveshareUPSHat:
         shunt_mv=(shunt_raw-65536 if shunt_raw > 32767 else shunt_raw)*0.01
         bus_voltage=(bus_raw >> 3)*0.004
         supply_voltage=bus_voltage+(shunt_mv/1000.0)
-        current_ma=(current_raw-65536 if current_raw > 32767 else current_raw)*self.CURRENT_LSB_MA
-        power_w=power_raw*self.POWER_LSB_W
+        current_ma=(current_raw-65536 if current_raw > 32767 else current_raw)*self.profile['current_lsb_ma']
+        if self.profile['reverse_current']:
+            current_ma=-current_ma
+        power_w=power_raw*self.profile['power_lsb_w']
         battery_percent=(bus_voltage-self.empty_voltage)/(self.full_voltage-self.empty_voltage)*100.0
         battery_percent=max(0.0,min(100.0,battery_percent))
         state='charging' if current_ma > 10.0 else 'discharging' if current_ma < -10.0 else 'idle'
         return {
-            'model':'Waveshare UPS HAT (B)', 'address':f'0x{self.addr:02x}',
+            'model':f'Waveshare UPS HAT ({self.model})', 'address':f'0x{self.addr:02x}',
             'bus_voltage_v':bus_voltage, 'shunt_voltage_mv':shunt_mv,
             'supply_voltage_v':supply_voltage, 'current_ma':current_ma,
             'power_w':power_w, 'battery_percent':battery_percent, 'state':state
@@ -424,9 +438,10 @@ class UPSWorker(threading.Thread):
                 bus,
                 int(CONFIG['ups_address']),
                 float(CONFIG['ups_empty_voltage']),
-                float(CONFIG['ups_full_voltage'])
+                float(CONFIG['ups_full_voltage']),
+                CONFIG.get('ups_model','D')
             )
-            print(f'Waveshare UPS HAT ready at 0x{sensor.addr:02x}', flush=True)
+            print(f'Waveshare UPS HAT ({sensor.model}) ready at 0x{sensor.addr:02x}', flush=True)
         except Exception as e:
             STATE.add_error(f'Waveshare UPS HAT init: {e}'); return
         while RUNNING:

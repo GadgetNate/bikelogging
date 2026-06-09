@@ -13,7 +13,7 @@ OUT=/tmp/bikelogger_setup_report_$(date +%Y%m%d_%H%M%S).txt
   echo "=== STATUS JSON ==="; curl -s http://127.0.0.1:8080/status.json || true; echo
   echo "=== CAMERA ==="; libcamera-hello --list-cameras 2>&1 || true
   echo "=== I2C ==="; i2cdetect -y 1 2>/dev/null || true
-  echo "=== UPS HAT ==="; i2cget -y 1 0x42 0x02 w 2>/dev/null || true
+  echo "=== UPS HAT (D) ==="; i2cget -y 1 0x43 0x02 w 2>/dev/null || true
   echo "=== SERIAL ==="; ls -l /dev/serial* /dev/ttyAMA* /dev/ttyS* 2>/dev/null || true
   echo "=== GPS SAMPLE 5s ==="; timeout 5 cat /dev/serial0 2>/dev/null | head -10 || true
   echo "=== WIFI ==="; iw dev 2>/dev/null || true

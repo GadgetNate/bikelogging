@@ -10,7 +10,7 @@ Current target hardware:
 - BME280/BMP280 on I2C bus 1, address `0x76` or `0x77`
 - Pololu LSM303DLHC compass/accelerometer carrier on I2C bus 1 (`0x19` and `0x1e`)
 - Optional L3GD20 gyroscope at `0x6a` or `0x6b`
-- Waveshare UPS HAT (B) INA219 on I2C bus 1 at `0x42`
+- Waveshare UPS HAT (D) INA219 on I2C bus 1 at `0x43`
 - Start button on GPIO27
 - Stop button on GPIO17
 - Built-in WiFi scanning with recent hotspot details in RideHub
@@ -159,12 +159,16 @@ accelerometer/magnetometer carrier. BikeLogger logs those six axes without
 requiring a separate gyroscope; gyro database fields remain empty when one is
 not installed.
 
-Expected Waveshare UPS HAT (B) address: `0x42`.
+Expected Waveshare UPS HAT (D) addresses:
+
+- INA219 battery monitor: `0x43`
+- Power-management MCU: `0x2d`
 
 BikeLogger records UPS bus voltage, shunt voltage, estimated supply voltage,
 signed current, power, charging/discharging state, and battery percentage.
-The percentage is a voltage-based estimate using the configured 6.0 V empty
-and 8.4 V full thresholds; it is not a coulomb-counted fuel gauge.
+The percentage is a voltage-based estimate using the configured 3.0 V empty
+and 4.2 V full thresholds for the HAT (D)'s parallel 21700 cells; it is not a
+coulomb-counted fuel gauge.
 
 Serial GPS:
 
