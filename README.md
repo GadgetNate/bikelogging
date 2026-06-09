@@ -176,9 +176,9 @@ sudo timeout 5 cat /dev/serial0
 Bluetooth:
 
 ```bash
-rfkill list bluetooth
 hciconfig -a
-sudo timeout 12 stdbuf -oL -eL btmgmt --index 0 find
+bluetoothctl show
+bluetoothctl --timeout 10 scan on
 ```
 
 The RideHub dashboard shows the most recent Bluetooth scan state, completion

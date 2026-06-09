@@ -618,10 +618,58 @@ def parse_btmgmt_devices(text):
             best[key]=row
     return sorted(best.values(), key=lambda r: r.get('rssi_dbm',-999), reverse=True)
 
+def parse_bluetoothctl_devices(scan_text, known_devices_text=''):
+    devices={}
+    ansi_re=re.compile(r'\x1b\[[0-9;?]*[A-Za-z]')
+    event_re=re.compile(r'^\[(?:NEW|CHG)\]\s+Device\s+([0-9A-Fa-f:]{17})(?:\s+(.*))?$')
+    known_re=re.compile(r'^Device\s+([0-9A-Fa-f:]{17})(?:\s+(.*))?$')
+
+    def device(address):
+        address=address.upper()
+        return devices.setdefault(address,{
+            'adapter':'hci0',
+            'address':address,
+            'address_type':'BlueZ',
+            'rssi_dbm':None,
+            'flags':''
+        })
+
+    for raw in scan_text.splitlines():
+        line=ansi_re.sub('',raw).strip()
+        match=event_re.match(line)
+        if not match:
+            continue
+        row=device(match.group(1))
+        detail=(match.group(2) or '').strip()
+        rssi=re.match(r'RSSI:\s+.*\((-?\d+)\)$',detail)
+        if rssi:
+            row['rssi_dbm']=int(rssi.group(1))
+            continue
+        name=re.match(r'(?:Name|Alias):\s+(.+)$',detail)
+        if name and CONFIG.get('log_bluetooth_names',True):
+            row['name']=name.group(1).strip()
+            continue
+        if detail and not re.match(r'(?:TxPower|UUIDs|ManufacturerData)\s*:',detail):
+            advertised=detail.strip()
+            if CONFIG.get('log_bluetooth_names',True) and advertised.replace('-',':').upper() != row['address']:
+                row['name']=advertised
+
+    for raw in known_devices_text.splitlines():
+        line=ansi_re.sub('',raw).strip()
+        match=known_re.match(line)
+        if not match:
+            continue
+        address=match.group(1).upper()
+        if address not in devices:
+            continue
+        advertised=(match.group(2) or '').strip()
+        if CONFIG.get('log_bluetooth_names',True) and advertised and advertised.replace('-',':').upper() != address:
+            devices[address]['name']=advertised
+
+    return sorted(devices.values(), key=lambda row: row.get('rssi_dbm') if row.get('rssi_dbm') is not None else -999, reverse=True)
+
 def bluetooth_scan_once():
-    """Scan with the Pi 4 built-in Bluetooth adapter and return nearby devices with RSSI when BlueZ reports it.
-    Uses btmgmt because bluetoothctl commonly omits RSSI in scripted scans. Service runs as root.
-    """
+    """Scan through bluetoothd and return nearby devices with RSSI."""
     duration=max(3, int(float(CONFIG.get('bluetooth_scan_duration_sec', 10))))
     index=int(CONFIG.get('bluetooth_adapter_index', 0))
     adapter=f'hci{index}'
@@ -630,24 +678,24 @@ def bluetooth_scan_once():
         if not Path(f'/sys/class/bluetooth/{adapter}').exists():
             status.update({'state':'unavailable','error':f'{adapter} not found','finished_at':now_iso(),'devices':0})
             return [],status
-        unblock=subprocess.run(['rfkill','unblock','bluetooth'], text=True, capture_output=True, timeout=5)
-        power=subprocess.run(['btmgmt','--index',str(index),'power','on'], text=True, capture_output=True, timeout=8)
-        command=['timeout',str(duration)]
-        if shutil.which('stdbuf'):
-            command.extend(['stdbuf','-oL','-eL'])
-        command.extend(['btmgmt','--index',str(index),'find'])
+        power=subprocess.run(['bluetoothctl','power','on'], text=True, capture_output=True, timeout=5)
+        command=['bluetoothctl','--timeout',str(duration),'scan','on']
         p=subprocess.run(command, text=True, capture_output=True, timeout=duration+5)
         text=(p.stdout or '') + '\n' + (p.stderr or '')
-        rows=parse_btmgmt_devices(text)
+        known=subprocess.run(['bluetoothctl','devices'], text=True, capture_output=True, timeout=5)
+        rows=parse_bluetoothctl_devices(text,known.stdout or '')
+        for row in rows:
+            row['adapter']=adapter
         errors=[]
-        if unblock.returncode != 0:
-            errors.append((unblock.stderr or unblock.stdout).strip())
         if power.returncode != 0:
             errors.append((power.stderr or power.stdout).strip())
-        if p.returncode not in (0,124):
-            errors.append(f'btmgmt exited {p.returncode}')
+        if p.returncode != 0:
+            errors.append(f'bluetoothctl scan exited {p.returncode}')
+        if known.returncode != 0:
+            errors.append(f'bluetoothctl devices exited {known.returncode}')
         status.update({
             'state':'ok' if rows else 'no devices',
+            'backend':'bluetoothctl',
             'finished_at':now_iso(),
             'devices':len(rows),
             'return_code':p.returncode,

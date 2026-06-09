@@ -182,6 +182,39 @@ def test_parse_btmgmt_devices_multiline_name_and_ansi():
         'name':'Heart Rate Monitor'
     }]
 
+def test_parse_bluetoothctl_devices_with_rssi_and_names():
+    scan = '''
+SetDiscoveryFilter success
+Discovery started
+[\x1b[0;92mNEW\x1b[0m] Device 98:17:3C:F8:9D:E3 ihoment_H6008_9DE3
+[\x1b[0;93mCHG\x1b[0m] Device 98:17:3C:F8:9D:E3 RSSI: 0xffffffb3 (-77)
+[\x1b[0;93mCHG\x1b[0m] Device 74:02:E1:BC:44:A1 RSSI: 0xffffffa9 (-87)
+[\x1b[0;93mCHG\x1b[0m] Device 74:02:E1:BC:44:A1 Name: Bike Sensor
+[\x1b[0;93mCHG\x1b[0m] Device 74:02:E1:BC:44:A1 TxPower: 0x0008 (8)
+'''
+    known = '''
+Device 98:17:3C:F8:9D:E3 ihoment_H6008_9DE3
+Device 74:02:E1:BC:44:A1 Bike Sensor
+Device AA:BB:CC:DD:EE:FF stale-device
+'''
+    rows = mod.parse_bluetoothctl_devices(scan,known)
+
+    assert rows == [
+        {'adapter':'hci0','address':'98:17:3C:F8:9D:E3','address_type':'BlueZ','rssi_dbm':-77,'flags':'','name':'ihoment_H6008_9DE3'},
+        {'adapter':'hci0','address':'74:02:E1:BC:44:A1','address_type':'BlueZ','rssi_dbm':-87,'flags':'','name':'Bike Sensor'}
+    ]
+
+def test_parse_bluetoothctl_devices_keeps_new_device_without_rssi():
+    rows = mod.parse_bluetoothctl_devices('[NEW] Device 63:99:F8:D9:D0:60 63-99-F8-D9-D0-60')
+
+    assert rows == [{
+        'adapter':'hci0',
+        'address':'63:99:F8:D9:D0:60',
+        'address_type':'BlueZ',
+        'rssi_dbm':None,
+        'flags':''
+    }]
+
 def test_dashboard_helpers_escape_content():
     table = mod.data_table([{'name':'<script>','rssi':-40}],[('name','Name'),('rssi','RSSI')])
     page = mod.page('Test <title>', table, refresh=5)
