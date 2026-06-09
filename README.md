@@ -28,6 +28,8 @@ Photos are stored under:
 /var/lib/bikelogger/rides/<ride_id>/photos/
 ```
 
+The Pi configuration captures one photo per second while a ride is active.
+
 ## Recommended workflow
 
 Use GitHub as the source of truth.

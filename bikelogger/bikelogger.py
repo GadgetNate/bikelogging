@@ -38,7 +38,7 @@ def load_config():
     default = {
         'web_host': '0.0.0.0', 'web_port': 8080,
         'gps_port': '/dev/serial0', 'gps_baud': 38400,
-        'camera_interval_sec': 5.0, 'camera_width': 2304, 'camera_height': 1296,
+        'camera_interval_sec': 1.0, 'camera_width': 2304, 'camera_height': 1296,
         'camera_quality': 92, 'camera_autofocus': 'continuous', 'camera_rotation_degrees': 180,
         'env_interval_sec': 2.0, 'gps_interval_note': 'GPS logs as NMEA sentences arrive',
         'wifi_interval_sec': 30.0, 'bluetooth_interval_sec': 60.0, 'bluetooth_scan_duration_sec': 10.0, 'health_interval_sec': 10.0,
