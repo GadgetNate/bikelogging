@@ -65,3 +65,43 @@ def test_minimu9_v2_read_and_scale():
     assert math.isclose(data['mag_x_gauss'], 1.0)
     assert math.isclose(data['mag_y_gauss'], 0.5)
     assert math.isclose(data['mag_z_gauss'], -1.0)
+
+class FakeUPSHatBus:
+    def __init__(self):
+        self.writes = []
+        self.registers = {
+            0x01: [0xFC, 0x18],
+            0x02: [0x38, 0x40],
+            0x03: [0x07, 0x08],
+            0x04: [0xEC, 0x78]
+        }
+
+    def write_i2c_block_data(self, addr, register, data):
+        self.writes.append((addr, register, data))
+
+    def read_i2c_block_data(self, addr, register, length):
+        assert addr == 0x42
+        assert length == 2
+        return self.registers[register]
+
+def test_waveshare_ups_hat_read_and_scale():
+    bus = FakeUPSHatBus()
+    sensor = mod.WaveshareUPSHat(bus, 0x42, 6.0, 8.4)
+    data = sensor.read()
+
+    assert (0x42, 0x05, [0x10, 0x00]) in bus.writes
+    assert (0x42, 0x00, [0x39, 0x9F]) in bus.writes
+    assert math.isclose(data['bus_voltage_v'], 7.2)
+    assert math.isclose(data['shunt_voltage_mv'], -10.0)
+    assert math.isclose(data['supply_voltage_v'], 7.19)
+    assert math.isclose(data['current_ma'], -500.0)
+    assert math.isclose(data['power_w'], 3.6)
+    assert math.isclose(data['battery_percent'], 50.0)
+    assert data['state'] == 'discharging'
+
+def test_waveshare_ups_hat_rejects_invalid_voltage_range():
+    try:
+        mod.WaveshareUPSHat(FakeUPSHatBus(), 0x42, 8.4, 6.0)
+        assert False
+    except ValueError:
+        pass

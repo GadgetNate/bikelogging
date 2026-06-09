@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """BikeLogger Pi 4: lightweight ride logger + RideHub web UI.
 Features: GPIO start/stop, serial GPS NMEA at 38400, BME280, Pololu MiniIMU-9 v2,
-persistent Picamera2 autofocus capture,
+Waveshare UPS HAT power monitoring, persistent Picamera2 autofocus capture,
 plain-text WiFi scans, built-in Bluetooth device/RSSI scans, health logging, per-ride SQLite, local web history browser.
 """
 import os, sys, time, json, math, glob, sqlite3, threading, subprocess, shutil, signal, html, re
@@ -37,6 +37,8 @@ def load_config():
         'imu_interval_sec': 0.1,
         'imu_accel_address': 0x19, 'imu_mag_address': 0x1E,
         'imu_gyro_addresses': [0x6B, 0x6A],
+        'ups_interval_sec': 2.0, 'ups_address': 0x42,
+        'ups_empty_voltage': 6.0, 'ups_full_voltage': 8.4,
         'capture_when_idle': False,
         'log_plain_wifi_ssid': True,
         'log_bluetooth_names': True,
@@ -64,6 +66,7 @@ class State:
         self.last_gps = {}
         self.last_env = {}
         self.last_imu = {}
+        self.last_ups = {}
         self.last_health = {}
         self.last_camera = {}
         self.last_wifi_count = 0
@@ -97,6 +100,7 @@ def init_db(path):
         '''create table if not exists gps(ts text, lat real, lon real, alt_m real, speed_knots real, course_deg real, fix_quality integer, sats integer, hdop real, raw text)''',
         '''create table if not exists environment(ts text, sensor text, temperature_c real, humidity_pct real, pressure_hpa real, data_json text)''',
         '''create table if not exists imu(ts text, accel_x_raw integer, accel_y_raw integer, accel_z_raw integer, accel_x_g real, accel_y_g real, accel_z_g real, gyro_x_raw integer, gyro_y_raw integer, gyro_z_raw integer, gyro_x_dps real, gyro_y_dps real, gyro_z_dps real, mag_x_raw integer, mag_y_raw integer, mag_z_raw integer, mag_x_gauss real, mag_y_gauss real, mag_z_gauss real, data_json text)''',
+        '''create table if not exists ups(ts text, model text, address text, bus_voltage_v real, shunt_voltage_mv real, supply_voltage_v real, current_ma real, power_w real, battery_percent real, state text, data_json text)''',
         '''create table if not exists wifi(ts text, iface text, bssid text, ssid text, signal_dbm real, freq_mhz integer, channel integer, data_json text)''',
         '''create table if not exists bluetooth(ts text, adapter text, address text, address_type text, name text, rssi_dbm real, flags text, data_json text)''',
         '''create table if not exists camera(ts text, file text, width integer, height integer, status text, data_json text)''',
@@ -354,6 +358,84 @@ class IMUWorker(threading.Thread):
                 STATE.add_error(f'MiniIMU-9 v2 read: {e}')
             time.sleep(max(0.02, float(CONFIG['imu_interval_sec'])))
 
+class WaveshareUPSHat:
+    CALIBRATION = 4096
+    CONFIG_32V_2A = 0x399F
+    CURRENT_LSB_MA = 0.1
+    POWER_LSB_W = 0.002
+
+    def __init__(self, bus, addr, empty_voltage, full_voltage):
+        self.bus = bus
+        self.addr = addr
+        self.empty_voltage = empty_voltage
+        self.full_voltage = full_voltage
+        if self.full_voltage <= self.empty_voltage:
+            raise ValueError('UPS full voltage must be greater than empty voltage')
+        self.write_register(0x05, self.CALIBRATION)
+        self.write_register(0x00, self.CONFIG_32V_2A)
+        self.read_register(0x02)
+
+    def read_register(self, register):
+        data=self.bus.read_i2c_block_data(self.addr, register, 2)
+        return (data[0] << 8) | data[1]
+
+    def write_register(self, register, value):
+        self.bus.write_i2c_block_data(self.addr, register, [(value >> 8) & 0xFF, value & 0xFF])
+
+    def read(self):
+        self.write_register(0x05, self.CALIBRATION)
+        shunt_raw=self.read_register(0x01)
+        bus_raw=self.read_register(0x02)
+        current_raw=self.read_register(0x04)
+        power_raw=self.read_register(0x03)
+
+        shunt_mv=(shunt_raw-65536 if shunt_raw > 32767 else shunt_raw)*0.01
+        bus_voltage=(bus_raw >> 3)*0.004
+        supply_voltage=bus_voltage+(shunt_mv/1000.0)
+        current_ma=(current_raw-65536 if current_raw > 32767 else current_raw)*self.CURRENT_LSB_MA
+        power_w=power_raw*self.POWER_LSB_W
+        battery_percent=(bus_voltage-self.empty_voltage)/(self.full_voltage-self.empty_voltage)*100.0
+        battery_percent=max(0.0,min(100.0,battery_percent))
+        state='charging' if current_ma > 10.0 else 'discharging' if current_ma < -10.0 else 'idle'
+        return {
+            'model':'Waveshare UPS HAT (B)', 'address':f'0x{self.addr:02x}',
+            'bus_voltage_v':bus_voltage, 'shunt_voltage_mv':shunt_mv,
+            'supply_voltage_v':supply_voltage, 'current_ma':current_ma,
+            'power_w':power_w, 'battery_percent':battery_percent, 'state':state
+        }
+
+class UPSWorker(threading.Thread):
+    daemon=True
+    def run(self):
+        try:
+            try: import smbus
+            except Exception: import smbus2 as smbus
+            bus=smbus.SMBus(int(CONFIG['i2c_bus']))
+            sensor=WaveshareUPSHat(
+                bus,
+                int(CONFIG['ups_address']),
+                float(CONFIG['ups_empty_voltage']),
+                float(CONFIG['ups_full_voltage'])
+            )
+            print(f'Waveshare UPS HAT ready at 0x{sensor.addr:02x}', flush=True)
+        except Exception as e:
+            STATE.add_error(f'Waveshare UPS HAT init: {e}'); return
+        while RUNNING:
+            try:
+                data=sensor.read(); ts=now_iso()
+                with STATE.lock: STATE.last_ups=data
+                if STATE.db:
+                    db_exec(
+                        'insert into ups values(?,?,?,?,?,?,?,?,?,?,?)',
+                        (ts,data['model'],data['address'],data['bus_voltage_v'],
+                         data['shunt_voltage_mv'],data['supply_voltage_v'],
+                         data['current_ma'],data['power_w'],data['battery_percent'],
+                         data['state'],json.dumps(data))
+                    )
+            except Exception as e:
+                STATE.add_error(f'Waveshare UPS HAT read: {e}')
+            time.sleep(max(0.2, float(CONFIG['ups_interval_sec'])))
+
 class CameraWorker(threading.Thread):
     daemon=True
     def run(self):
@@ -553,7 +635,7 @@ def list_rides():
                 db=sqlite3.connect(str(dbp));
                 meta=dict(db.execute('select key,value from meta').fetchall())
                 info.update({k:meta.get(k,'') for k in ('started_at','stopped_at')})
-                for table in ('gps','environment','imu','wifi','bluetooth','camera','health','events'):
+                for table in ('gps','environment','imu','ups','wifi','bluetooth','camera','health','events'):
                     try: info[table]=db.execute(f'select count(*) from {table}').fetchone()[0]
                     except sqlite3.OperationalError: info[table]=0
                 db.close()
@@ -588,7 +670,7 @@ class Handler(BaseHTTPRequestHandler):
             if not dbp.exists(): self.send('ride not found','text/plain',404); return
             db=sqlite3.connect(str(dbp)); db.row_factory=sqlite3.Row
             counts={}
-            for t in ('gps','environment','imu','wifi','bluetooth','camera','health','events'):
+            for t in ('gps','environment','imu','ups','wifi','bluetooth','camera','health','events'):
                 try: counts[t]=db.execute(f'select count(*) from {t}').fetchone()[0]
                 except Exception: counts[t]=0
             latest_gps=db.execute('select * from gps where lat is not null and lon is not null order by ts desc limit 1').fetchone()
@@ -599,11 +681,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send(page('Ride '+rid, body)); return
         if path=='/status.json':
             with STATE.lock:
-                obj={'ride_id':STATE.ride_id,'started_at':STATE.started_at,'last_gps':STATE.last_gps,'last_env':STATE.last_env,'last_imu':STATE.last_imu,'last_health':STATE.last_health,'last_camera':STATE.last_camera,'camera_status':STATE.camera_status,'last_wifi_count':STATE.last_wifi_count,'last_bluetooth_count':STATE.last_bluetooth_count,'errors':STATE.errors[-10:], 'rides_dir':str(RIDES_DIR)}
+                obj={'ride_id':STATE.ride_id,'started_at':STATE.started_at,'last_gps':STATE.last_gps,'last_env':STATE.last_env,'last_imu':STATE.last_imu,'last_ups':STATE.last_ups,'last_health':STATE.last_health,'last_camera':STATE.last_camera,'camera_status':STATE.camera_status,'last_wifi_count':STATE.last_wifi_count,'last_bluetooth_count':STATE.last_bluetooth_count,'errors':STATE.errors[-10:], 'rides_dir':str(RIDES_DIR)}
             self.send(json.dumps(obj,indent=2,default=str),'application/json'); return
         rides=list_rides()
         with STATE.lock:
-            status={'ride_id':STATE.ride_id,'started_at':STATE.started_at,'gps':STATE.last_gps,'env':STATE.last_env,'imu':STATE.last_imu,'health':STATE.last_health,'camera':STATE.camera_status,'wifi_count':STATE.last_wifi_count,'bluetooth_count':STATE.last_bluetooth_count,'errors':STATE.errors[-5:]}
+            status={'ride_id':STATE.ride_id,'started_at':STATE.started_at,'gps':STATE.last_gps,'env':STATE.last_env,'imu':STATE.last_imu,'ups':STATE.last_ups,'health':STATE.last_health,'camera':STATE.camera_status,'wifi_count':STATE.last_wifi_count,'bluetooth_count':STATE.last_bluetooth_count,'errors':STATE.errors[-5:]}
         controls='<form method="post" action="/api/start"><button>Start ride</button></form><form method="post" action="/api/stop"><button>Stop ride</button></form>'
         cards=''.join(f'<div class="card"><h2><a href="/ride/{html.escape(r["id"])}">{html.escape(r["id"])}</a></h2><pre>{html.escape(json.dumps(r,indent=2))}</pre></div>' for r in rides)
         body=f'{controls}<p><a href="/status.json">status.json</a></p><div class="card"><h2>Current status</h2><pre>{html.escape(json.dumps(status,indent=2,default=str))}</pre></div><h2>Historic rides</h2>{cards or "No rides yet."}'
@@ -615,7 +697,7 @@ def main():
         RUNNING=False; stop_ride(f'signal {sig}'); sys.exit(0)
     signal.signal(signal.SIGTERM, handle); signal.signal(signal.SIGINT, handle)
     print('BikeLogger starting', now_iso(), flush=True)
-    threads=[GPSWorker(), EnvWorker(), IMUWorker(), CameraWorker(), WiFiWorker(), BluetoothWorker(), HealthWorker(), ButtonWorker()]
+    threads=[GPSWorker(), EnvWorker(), IMUWorker(), UPSWorker(), CameraWorker(), WiFiWorker(), BluetoothWorker(), HealthWorker(), ButtonWorker()]
     for t in threads: t.start()
     host=CONFIG['web_host']; port=int(CONFIG['web_port'])
     print(f'RideHub web: http://{host}:{port}', flush=True)

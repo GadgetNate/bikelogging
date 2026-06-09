@@ -9,6 +9,7 @@ Current target hardware:
 - Serial GPS on `/dev/serial0` at 38400 baud
 - BME280/BMP280 on I2C bus 1, address `0x76` or `0x77`
 - Pololu MiniIMU-9 v2 on I2C bus 1 (`0x19`, `0x1e`, and `0x6a` or `0x6b`)
+- Waveshare UPS HAT (B) INA219 on I2C bus 1 at `0x42`
 - Start button on GPIO27
 - Stop button on GPIO17
 - Built-in WiFi scanning
@@ -148,6 +149,13 @@ Expected MiniIMU-9 v2 addresses:
 - LSM303DLHC accelerometer: `0x19`
 - LSM303DLHC magnetometer: `0x1e`
 - L3GD20 gyroscope: `0x6a` or `0x6b`
+
+Expected Waveshare UPS HAT (B) address: `0x42`.
+
+BikeLogger records UPS bus voltage, shunt voltage, estimated supply voltage,
+signed current, power, charging/discharging state, and battery percentage.
+The percentage is a voltage-based estimate using the configured 6.0 V empty
+and 8.4 V full thresholds; it is not a coulomb-counted fuel gauge.
 
 Serial GPS:
 
