@@ -66,6 +66,49 @@ def test_minimu9_v2_read_and_scale():
     assert math.isclose(data['mag_y_gauss'], 0.5)
     assert math.isclose(data['mag_z_gauss'], -1.0)
 
+class FakeLSM303Bus(FakeIMUBus):
+    def read_byte_data(self, addr, register):
+        raise OSError('gyro not installed')
+
+def test_lsm303dlhc_logs_without_gyro():
+    bus = FakeLSM303Bus()
+    sensor = mod.MiniIMU9V2(bus, 0x19, 0x1E, [0x6B, 0x6A])
+    data = sensor.read()
+
+    assert sensor.gyro_addr is None
+    assert math.isclose(data['accel_x_g'], 1.024)
+    assert data['gyro_x_raw'] is None
+    assert data['gyro_x_dps'] is None
+    assert math.isclose(data['mag_x_gauss'], 1.0)
+    assert not any(write[0] in (0x6A, 0x6B) for write in bus.writes)
+
+def test_parse_iw_scan_hotspots():
+    text = '''
+BSS 30:57:8e:ef:7a:a3(on wlan0)
+        freq: 2412
+        signal: -47.00 dBm
+        SSID: OurPlace
+BSS c8:c6:fe:27:c6:83(on wlan0)
+        freq: 5180
+        signal: -51.00 dBm
+        SSID:
+BSS Load:
+        signal: -1.00 dBm
+'''
+    rows = mod.parse_iw_scan(text, 'wlan0')
+
+    assert rows == [
+        {'iface':'wlan0','bssid':'30:57:8e:ef:7a:a3','freq_mhz':2412,'channel':1,'signal_dbm':-47.0,'ssid':'OurPlace'},
+        {'iface':'wlan0','bssid':'c8:c6:fe:27:c6:83','freq_mhz':5180,'channel':36,'signal_dbm':-51.0,'ssid':'(hidden)'}
+    ]
+
+def test_wifi_channel_mapping():
+    assert mod.wifi_channel(2412) == 1
+    assert mod.wifi_channel(2484) == 14
+    assert mod.wifi_channel(5180) == 36
+    assert mod.wifi_channel(5955) == 1
+    assert mod.wifi_channel(1234) is None
+
 class FakeUPSHatBus:
     def __init__(self):
         self.writes = []

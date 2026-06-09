@@ -8,11 +8,12 @@ Current target hardware:
 - Raspberry Pi Camera Module 3 / IMX708 using Picamera2/libcamera
 - Serial GPS on `/dev/serial0` at 38400 baud
 - BME280/BMP280 on I2C bus 1, address `0x76` or `0x77`
-- Pololu MiniIMU-9 v2 on I2C bus 1 (`0x19`, `0x1e`, and `0x6a` or `0x6b`)
+- Pololu LSM303DLHC compass/accelerometer carrier on I2C bus 1 (`0x19` and `0x1e`)
+- Optional L3GD20 gyroscope at `0x6a` or `0x6b`
 - Waveshare UPS HAT (B) INA219 on I2C bus 1 at `0x42`
 - Start button on GPIO27
 - Stop button on GPIO17
-- Built-in WiFi scanning
+- Built-in WiFi scanning with recent hotspot details in RideHub
 - Built-in Bluetooth LE scanning with RSSI
 
 Ride data is stored in per-ride SQLite databases under:
@@ -133,6 +134,9 @@ Open the web UI:
 http://<raspberry-pi-ip>:8080/
 ```
 
+RideHub shows the 20 strongest hotspots from the most recent WiFi scan,
+including SSID, BSSID, signal strength, channel, frequency, and interface.
+
 ## Hardware checks
 
 I2C:
@@ -144,11 +148,16 @@ i2cdetect -y 1
 
 Expected BME280/BMP280 address: `0x76` or `0x77`.
 
-Expected MiniIMU-9 v2 addresses:
+Expected Pololu LSM303DLHC carrier addresses:
 
 - LSM303DLHC accelerometer: `0x19`
 - LSM303DLHC magnetometer: `0x1e`
-- L3GD20 gyroscope: `0x6a` or `0x6b`
+- Optional L3GD20 gyroscope: `0x6a` or `0x6b`
+
+The CMP01B board marked `0J3889` is the standalone LSM303DLHC
+accelerometer/magnetometer carrier. BikeLogger logs those six axes without
+requiring a separate gyroscope; gyro database fields remain empty when one is
+not installed.
 
 Expected Waveshare UPS HAT (B) address: `0x42`.
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """BikeLogger Pi 4: lightweight ride logger + RideHub web UI.
-Features: GPIO start/stop, serial GPS NMEA at 38400, BME280, Pololu MiniIMU-9 v2,
+Features: GPIO start/stop, serial GPS NMEA at 38400, BME280, Pololu LSM303DLHC,
 Waveshare UPS HAT power monitoring, persistent Picamera2 autofocus capture,
 plain-text WiFi scans, built-in Bluetooth device/RSSI scans, health logging, per-ride SQLite, local web history browser.
 """
@@ -72,6 +72,7 @@ class State:
         self.last_camera = {}
         self.last_wifi_count = 0
         self.last_wifi_devices = []
+        self.last_wifi_scan_at = None
         self.last_bluetooth_count = 0
         self.last_bluetooth_devices = []
         self.bluetooth_status = {'state':'not scanned'}
@@ -291,28 +292,29 @@ class MiniIMU9V2:
                     break
             except Exception:
                 pass
-        if self.gyro_addr is None:
-            raise RuntimeError('L3GD20 not found at configured addresses')
 
         bus.write_byte_data(self.accel_addr, 0x20, 0x57)
         bus.write_byte_data(self.accel_addr, 0x23, 0x88)
-        bus.write_byte_data(self.gyro_addr, 0x20, 0x0F)
-        bus.write_byte_data(self.gyro_addr, 0x23, 0x80)
+        if self.gyro_addr is not None:
+            bus.write_byte_data(self.gyro_addr, 0x20, 0x0F)
+            bus.write_byte_data(self.gyro_addr, 0x23, 0x80)
         bus.write_byte_data(self.mag_addr, 0x00, 0x14)
         bus.write_byte_data(self.mag_addr, 0x01, 0x20)
         bus.write_byte_data(self.mag_addr, 0x02, 0x00)
 
     def read(self):
         accel=self.bus.read_i2c_block_data(self.accel_addr, 0x28 | 0x80, 6)
-        gyro=self.bus.read_i2c_block_data(self.gyro_addr, 0x28 | 0x80, 6)
         mag=self.bus.read_i2c_block_data(self.mag_addr, 0x03, 6)
 
         ax=signed_16(accel[0], accel[1]) >> 4
         ay=signed_16(accel[2], accel[3]) >> 4
         az=signed_16(accel[4], accel[5]) >> 4
-        gx=signed_16(gyro[0], gyro[1])
-        gy=signed_16(gyro[2], gyro[3])
-        gz=signed_16(gyro[4], gyro[5])
+        gx=gy=gz=None
+        if self.gyro_addr is not None:
+            gyro=self.bus.read_i2c_block_data(self.gyro_addr, 0x28 | 0x80, 6)
+            gx=signed_16(gyro[0], gyro[1])
+            gy=signed_16(gyro[2], gyro[3])
+            gz=signed_16(gyro[4], gyro[5])
         mx=signed_16_be(mag[0], mag[1])
         mz=signed_16_be(mag[2], mag[3])
         my=signed_16_be(mag[4], mag[5])
@@ -321,7 +323,9 @@ class MiniIMU9V2:
             'accel_x_raw':ax, 'accel_y_raw':ay, 'accel_z_raw':az,
             'accel_x_g':ax*self.ACCEL_SCALE_G, 'accel_y_g':ay*self.ACCEL_SCALE_G, 'accel_z_g':az*self.ACCEL_SCALE_G,
             'gyro_x_raw':gx, 'gyro_y_raw':gy, 'gyro_z_raw':gz,
-            'gyro_x_dps':gx*self.GYRO_SCALE_DPS, 'gyro_y_dps':gy*self.GYRO_SCALE_DPS, 'gyro_z_dps':gz*self.GYRO_SCALE_DPS,
+            'gyro_x_dps':gx*self.GYRO_SCALE_DPS if gx is not None else None,
+            'gyro_y_dps':gy*self.GYRO_SCALE_DPS if gy is not None else None,
+            'gyro_z_dps':gz*self.GYRO_SCALE_DPS if gz is not None else None,
             'mag_x_raw':mx, 'mag_y_raw':my, 'mag_z_raw':mz,
             'mag_x_gauss':mx*self.MAG_XY_SCALE_GAUSS, 'mag_y_gauss':my*self.MAG_XY_SCALE_GAUSS, 'mag_z_gauss':mz*self.MAG_Z_SCALE_GAUSS
         }
@@ -339,9 +343,10 @@ class IMUWorker(threading.Thread):
                 int(CONFIG['imu_mag_address']),
                 [int(addr) for addr in CONFIG['imu_gyro_addresses']]
             )
-            print(f'MiniIMU-9 v2 ready: accel 0x{sensor.accel_addr:02x}, mag 0x{sensor.mag_addr:02x}, gyro 0x{sensor.gyro_addr:02x}', flush=True)
+            gyro_status=f'0x{sensor.gyro_addr:02x}' if sensor.gyro_addr is not None else 'not installed'
+            print(f'Pololu LSM303DLHC ready: accel 0x{sensor.accel_addr:02x}, mag 0x{sensor.mag_addr:02x}, gyro {gyro_status}', flush=True)
         except Exception as e:
-            STATE.add_error(f'MiniIMU-9 v2 init: {e}'); return
+            STATE.add_error(f'Pololu LSM303DLHC init: {e}'); return
         while RUNNING:
             try:
                 data=sensor.read(); ts=now_iso()
@@ -359,7 +364,7 @@ class IMUWorker(threading.Thread):
                          json.dumps(data))
                     )
             except Exception as e:
-                STATE.add_error(f'MiniIMU-9 v2 read: {e}')
+                STATE.add_error(f'Pololu LSM303DLHC read: {e}')
             time.sleep(max(0.02, float(CONFIG['imu_interval_sec'])))
 
 class WaveshareUPSHat:
@@ -496,31 +501,66 @@ class CameraWorker(threading.Thread):
                 except Exception: pass
                 picam=None; time.sleep(5)
 
+def wifi_channel(freq_mhz):
+    if freq_mhz == 2484:
+        return 14
+    if 2412 <= freq_mhz <= 2472:
+        return (freq_mhz - 2407) // 5
+    if 5000 <= freq_mhz <= 5895:
+        return (freq_mhz - 5000) // 5
+    if 5955 <= freq_mhz <= 7115:
+        return (freq_mhz - 5950) // 5
+    return None
+
+def parse_iw_scan(text, iface):
+    rows=[]
+    current=None
+    bssid_re=re.compile(r'^BSS\s+([0-9a-f]{2}(?::[0-9a-f]{2}){5})(?:\(|\s|$)', re.I)
+    for raw in text.splitlines():
+        line=raw.strip()
+        match=bssid_re.match(line)
+        if match:
+            if current:
+                rows.append(current)
+            current={'iface':iface,'bssid':match.group(1).lower()}
+        elif line.startswith('BSS '):
+            if current:
+                rows.append(current)
+            current=None
+        elif current and line.startswith('SSID:'):
+            current['ssid']=line[5:].strip() or '(hidden)'
+        elif current and line.startswith('signal:'):
+            try:
+                current['signal_dbm']=float(line.split()[1])
+            except (IndexError, ValueError):
+                pass
+        elif current and line.startswith('freq:'):
+            try:
+                current['freq_mhz']=int(line.split()[1])
+                current['channel']=wifi_channel(current['freq_mhz'])
+            except (IndexError, ValueError):
+                pass
+    if current:
+        rows.append(current)
+    return rows
+
 def wifi_scan_once():
     out=[]
     try:
         ifaces=[x for x in os.listdir('/sys/class/net') if x.startswith('wl')]
         for iface in ifaces:
             p=subprocess.run(['iw','dev',iface,'scan'], text=True, capture_output=True, timeout=20)
-            text=p.stdout or p.stderr
-            current=None
-            for line in text.splitlines():
-                line=line.strip()
-                if line.startswith('BSS '):
-                    if current: out.append(current)
-                    current={'iface':iface,'bssid':line.split()[1].split('(')[0]}
-                elif current and line.startswith('SSID:'):
-                    current['ssid']=line[5:].strip()
-                elif current and line.startswith('signal:'):
-                    try: current['signal_dbm']=float(line.split()[1])
-                    except Exception: pass
-                elif current and line.startswith('freq:'):
-                    try: current['freq_mhz']=int(line.split()[1])
-                    except Exception: pass
-            if current: out.append(current)
+            if p.returncode and not p.stdout:
+                raise RuntimeError((p.stderr or f'iw scan exited {p.returncode}').strip())
+            out.extend(parse_iw_scan(p.stdout, iface))
     except Exception as e:
         STATE.add_error(f'WiFi scan: {e}')
-    return out
+    deduped={}
+    for row in out:
+        previous=deduped.get(row['bssid'])
+        if previous is None or row.get('signal_dbm',-999) > previous.get('signal_dbm',-999):
+            deduped[row['bssid']]=row
+    return list(deduped.values())
 
 class WiFiWorker(threading.Thread):
     daemon=True
@@ -531,9 +571,10 @@ class WiFiWorker(threading.Thread):
             with STATE.lock:
                 STATE.last_wifi_count=len(rows)
                 STATE.last_wifi_devices=rows[:20]
+                STATE.last_wifi_scan_at=ts
             if STATE.db:
                 for r in rows:
-                    db_exec('insert into wifi values(?,?,?,?,?,?,?,?)',(ts,r.get('iface'),r.get('bssid'),r.get('ssid',''),r.get('signal_dbm'),r.get('freq_mhz'),None,json.dumps(r)))
+                    db_exec('insert into wifi values(?,?,?,?,?,?,?,?)',(ts,r.get('iface'),r.get('bssid'),r.get('ssid',''),r.get('signal_dbm'),r.get('freq_mhz'),r.get('channel'),json.dumps(r)))
             time.sleep(float(CONFIG['wifi_interval_sec']))
 
 def parse_btmgmt_devices(text):
@@ -838,11 +879,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send(page('Ride '+rid,body)); return
         if path=='/status.json':
             with STATE.lock:
-                obj={'ride_id':STATE.ride_id,'started_at':STATE.started_at,'last_gps':STATE.last_gps,'last_env':STATE.last_env,'last_imu':STATE.last_imu,'last_ups':STATE.last_ups,'last_health':STATE.last_health,'last_camera':STATE.last_camera,'camera_status':STATE.camera_status,'last_wifi_count':STATE.last_wifi_count,'last_wifi_devices':STATE.last_wifi_devices,'last_bluetooth_count':STATE.last_bluetooth_count,'last_bluetooth_devices':STATE.last_bluetooth_devices,'bluetooth_status':STATE.bluetooth_status,'errors':STATE.errors[-10:], 'rides_dir':str(RIDES_DIR)}
+                obj={'ride_id':STATE.ride_id,'started_at':STATE.started_at,'last_gps':STATE.last_gps,'last_env':STATE.last_env,'last_imu':STATE.last_imu,'last_ups':STATE.last_ups,'last_health':STATE.last_health,'last_camera':STATE.last_camera,'camera_status':STATE.camera_status,'last_wifi_count':STATE.last_wifi_count,'last_wifi_scan_at':STATE.last_wifi_scan_at,'last_wifi_devices':STATE.last_wifi_devices,'last_bluetooth_count':STATE.last_bluetooth_count,'last_bluetooth_devices':STATE.last_bluetooth_devices,'bluetooth_status':STATE.bluetooth_status,'errors':STATE.errors[-10:], 'rides_dir':str(RIDES_DIR)}
             self.send(json.dumps(obj,indent=2,default=str),'application/json'); return
         rides=list_rides()
         with STATE.lock:
-            status={'ride_id':STATE.ride_id,'started_at':STATE.started_at,'gps':STATE.last_gps.copy(),'env':STATE.last_env.copy(),'imu':STATE.last_imu.copy(),'ups':STATE.last_ups.copy(),'health':STATE.last_health.copy(),'camera':STATE.camera_status,'camera_data':STATE.last_camera.copy(),'wifi_count':STATE.last_wifi_count,'wifi_devices':list(STATE.last_wifi_devices),'bluetooth_count':STATE.last_bluetooth_count,'bluetooth_devices':list(STATE.last_bluetooth_devices),'bluetooth_status':STATE.bluetooth_status.copy(),'errors':STATE.errors[-8:]}
+            status={'ride_id':STATE.ride_id,'started_at':STATE.started_at,'gps':STATE.last_gps.copy(),'env':STATE.last_env.copy(),'imu':STATE.last_imu.copy(),'ups':STATE.last_ups.copy(),'health':STATE.last_health.copy(),'camera':STATE.camera_status,'camera_data':STATE.last_camera.copy(),'wifi_count':STATE.last_wifi_count,'wifi_scan_at':STATE.last_wifi_scan_at,'wifi_devices':list(STATE.last_wifi_devices),'bluetooth_count':STATE.last_bluetooth_count,'bluetooth_devices':list(STATE.last_bluetooth_devices),'bluetooth_status':STATE.bluetooth_status.copy(),'errors':STATE.errors[-8:]}
         env=next(iter(status['env'].values()),{}) if status['env'] else {}
         gps=status['gps']; imu=status['imu']; ups=status['ups']; health=status['health']; bt=status['bluetooth_status']
         ride_live=bool(status['ride_id'])
@@ -860,7 +901,7 @@ class Handler(BaseHTTPRequestHandler):
 <section class="card"><h2>System / camera</h2><div class="metrics">{metric("CPU",display_value(health.get("cpu_temp_c"),1," °C"))}{metric("Load",display_value(health.get("load1"),2))}{metric("Memory free",display_value(health.get("mem_available_kb"),0," kB"))}{metric("Disk free",display_value(health.get("disk_free_mb"),0," MB"))}{metric("Throttle",display_value(health.get("throttled")))}{metric("Camera",status["camera"])}{metric("Last capture",display_value(camera.get("captured_at")))}</div></section>
 <section class="card full"><h2>Latest photos</h2>{photo_gallery(latest_photos(8))}</section>
 <section class="card wide"><h2>Bluetooth devices</h2><p class="muted">Scan: {html.escape(display_value(bt.get("state")))} · {html.escape(display_value(bt.get("finished_at")))} · {status["bluetooth_count"]} devices{(" · "+html.escape(bt_detail)) if bt_detail else ""}</p>{data_table(status["bluetooth_devices"],[("name","Name"),("address","Address"),("address_type","Type"),("rssi_dbm","RSSI dBm")],"No Bluetooth devices reported by the last scan.")}</section>
-<section class="card"><h2>Nearby WiFi</h2><p class="muted">{status["wifi_count"]} networks in the last scan</p>{data_table(status["wifi_devices"][:8],[("ssid","SSID"),("signal_dbm","dBm")],"No WiFi networks reported.")}</section>
+<section class="card full"><h2>Most Recent WiFi Hotspots</h2><p class="muted">{status["wifi_count"]} networks · last scan {html.escape(display_value(status["wifi_scan_at"]))} · strongest signal first</p>{data_table(status["wifi_devices"],[("ssid","SSID"),("bssid","BSSID"),("signal_dbm","Signal dBm"),("channel","Channel"),("freq_mhz","Frequency MHz"),("iface","Interface")],"No WiFi hotspots reported by the last scan.")}</section>
 <section class="card full"><h2>Ride history</h2>{ride_history_table(ride_rows)}</section>
 <section class="card full"><h2>Recent errors</h2>{"<ul class=errors>"+errors+"</ul>" if errors else '<p class="muted">No recent errors.</p>'}</section>
 </div><p class="muted">Dashboard refreshes every 5 seconds.</p>'''
