@@ -19,7 +19,7 @@ apt-get update || true
 apt-get install -y \
   python3 python3-flask python3-serial python3-gpiozero python3-smbus \
   i2c-tools wireless-tools iw bluez rfkill libcamera-apps python3-picamera2 \
-  sqlite3 rsync curl jq git || true
+  sqlite3 rsync curl jq git ffmpeg || true
 
 if command -v raspi-config >/dev/null 2>&1; then
   raspi-config nonint do_i2c 0 || true
