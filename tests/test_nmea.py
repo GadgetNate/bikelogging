@@ -294,3 +294,24 @@ def test_camera_transform_options():
         assert False
     except ValueError:
         pass
+
+def test_usb_video_device_prefers_webcam_over_pi_nodes():
+    original_devices = mod.live_camera_devices
+    original_config = mod.CONFIG.copy()
+    try:
+        mod.CONFIG.pop('usb_video_device', None)
+        mod.CONFIG.pop('live_camera_device', None)
+        mod.CONFIG.pop('usb_camera_device', None)
+        mod.live_camera_devices = lambda: [
+            {'path':'/dev/video0','name':'unicam-image'},
+            {'path':'/dev/video10','name':'bcm2835-codec-decode'},
+            {'path':'/dev/video2','name':'HD Pro Webcam C920'},
+            {'path':'/dev/video3','name':'HD Pro Webcam C920'},
+        ]
+
+        assert mod.usb_video_device() == '/dev/video2'
+        assert mod.live_camera_device() == '/dev/video2'
+    finally:
+        mod.live_camera_devices = original_devices
+        mod.CONFIG.clear()
+        mod.CONFIG.update(original_config)

@@ -40,6 +40,8 @@ def load_config():
         'gps_port': '/dev/serial0', 'gps_baud': 38400,
         'camera_interval_sec': 1.0, 'camera_width': 2304, 'camera_height': 1296,
         'camera_quality': 92, 'camera_autofocus': 'continuous', 'camera_rotation_degrees': 180,
+        'usb_video_enabled': True, 'usb_video_width': 1280, 'usb_video_height': 720,
+        'usb_video_fps': 15, 'usb_video_input_format': 'mjpeg',
         'env_interval_sec': 2.0, 'gps_interval_note': 'GPS logs as NMEA sentences arrive',
         'wifi_interval_sec': 30.0, 'bluetooth_interval_sec': 60.0, 'bluetooth_scan_duration_sec': 10.0, 'health_interval_sec': 10.0,
         'bluetooth_adapter_index': 0,
@@ -82,6 +84,11 @@ class State:
         self.last_ups = {}
         self.last_health = {}
         self.last_camera = {}
+        self.last_usb_video = {}
+        self.usb_video_proc = None
+        self.usb_video_file = None
+        self.usb_video_started_at = None
+        self.usb_video_status = 'not recording'
         self.last_wifi_count = 0
         self.last_wifi_devices = []
         self.last_wifi_scan_at = None
@@ -134,6 +141,7 @@ def start_ride(reason='manual'):
         ride_dir = RIDES_DIR / ride_id
         (ride_dir / 'photos').mkdir(parents=True, exist_ok=True)
         (ride_dir / 'thumbs').mkdir(parents=True, exist_ok=True)
+        (ride_dir / 'videos').mkdir(parents=True, exist_ok=True)
         db_path = ride_dir / 'ride.sqlite'
         db = init_db(db_path)
         STATE.ride_id, STATE.ride_dir, STATE.db_path, STATE.db = ride_id, ride_dir, db_path, db
@@ -142,15 +150,18 @@ def start_ride(reason='manual'):
         for k,v in meta.items(): db.execute('insert or replace into meta values(?,?)', (k, json.dumps(v) if not isinstance(v,str) else v))
         db.execute('insert into events values(?,?,?,?)', (now_iso(), 'ride_start', reason, json.dumps(meta)))
         db.commit()
+        start_usb_video_recording(ride_id, ride_dir)
         print(f'RIDE START {ride_id}', flush=True)
         return ride_id
 
 def stop_ride(reason='manual'):
     with STATE.lock:
         if not STATE.ride_id:
+            stop_usb_video_recording(reason)
             return None
         rid = STATE.ride_id
         try:
+            stop_usb_video_recording(reason)
             STATE.db.execute('insert into events values(?,?,?,?)', (now_iso(), 'ride_stop', reason, '{}'))
             STATE.db.execute('insert or replace into meta values(?,?)', ('stopped_at', now_iso()))
             STATE.db.commit(); STATE.db.close()
@@ -808,6 +819,7 @@ def list_rides():
         if not d.is_dir(): continue
         dbp=d/'ride.sqlite'; photos=list((d/'photos').glob('*.jpg')) if (d/'photos').exists() else []
         info={'id':d.name,'photos':len(photos),'path':str(d)}
+        info['videos']=len(list((d/'videos').glob('*'))) if (d/'videos').exists() else 0
         if dbp.exists():
             try:
                 db=sqlite3.connect(str(dbp));
@@ -897,6 +909,112 @@ def live_camera_device():
             return device['path']
     return devices[0]['path'] if devices else '/dev/video0'
 
+def usb_video_device():
+    configured=CONFIG.get('usb_video_device') or CONFIG.get('live_camera_device') or CONFIG.get('usb_camera_device')
+    if configured:
+        return str(configured)
+    for device in live_camera_devices():
+        name=device.get('name','').lower()
+        if any(word in name for word in ('webcam','usb','uvc','logitech','camera c')):
+            return device['path']
+    return None
+
+def start_usb_video_recording(ride_id, ride_dir):
+    if not CONFIG.get('usb_video_enabled', True):
+        STATE.usb_video_status='disabled'
+        return
+    if STATE.usb_video_proc and STATE.usb_video_proc.poll() is None:
+        STATE.usb_video_status='already recording'
+        return
+    ffmpeg=shutil.which('ffmpeg')
+    if not ffmpeg:
+        STATE.usb_video_status='ffmpeg not found'
+        STATE.add_error('USB video recording: ffmpeg not found')
+        return
+    device=usb_video_device()
+    if not device or not Path(device).exists():
+        STATE.usb_video_status='USB camera not found'
+        return
+    width=int(CONFIG.get('usb_video_width', CONFIG.get('live_camera_width', 1280)))
+    height=int(CONFIG.get('usb_video_height', CONFIG.get('live_camera_height', 720)))
+    fps=int(CONFIG.get('usb_video_fps', CONFIG.get('live_camera_fps', 15)))
+    fmt=str(CONFIG.get('usb_video_input_format', CONFIG.get('live_camera_input_format', 'mjpeg')))
+    out=ride_dir/'videos'/f'usb_camera_{ride_id}.mkv'
+    log=ride_dir/'videos'/f'usb_camera_{ride_id}.ffmpeg.log'
+    command=[
+        ffmpeg,'-hide_banner','-loglevel','warning','-y',
+        '-f','v4l2','-input_format',fmt,
+        '-framerate',str(fps),'-video_size',f'{width}x{height}',
+        '-i',device,'-an','-c:v','copy','-f','matroska',str(out)
+    ]
+    try:
+        err=log.open('ab')
+        proc=subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=err)
+        err.close()
+        ts=now_iso()
+        data={'file':f'videos/{out.name}','log':f'videos/{log.name}','device':device,'width':width,'height':height,'fps':fps,'format':fmt,'started_at':ts,'command':command}
+        STATE.usb_video_proc=proc
+        STATE.usb_video_file=out
+        STATE.usb_video_started_at=ts
+        STATE.usb_video_status='recording'
+        STATE.last_usb_video=data
+        db_exec('insert into camera values(?,?,?,?,?,?)',(ts,f'videos/{out.name}',width,height,'video_start',json.dumps(data)))
+        print(f'USB video recording started: {out}', flush=True)
+    except Exception as e:
+        STATE.usb_video_status=f'start error: {e}'
+        STATE.add_error(f'USB video recording start: {e}')
+
+def stop_usb_video_recording(reason='manual'):
+    proc=STATE.usb_video_proc
+    out=STATE.usb_video_file
+    if not proc:
+        STATE.usb_video_status='not recording'
+        return
+    status='stopped'
+    try:
+        if proc.poll() is None:
+            try:
+                if proc.stdin:
+                    proc.stdin.write(b'q\n')
+                    proc.stdin.flush()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=float(CONFIG.get('usb_video_stop_timeout_sec', 8)))
+            except subprocess.TimeoutExpired:
+                status='terminated'
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    status='killed'
+                    proc.kill()
+                    proc.wait(timeout=3)
+        elif proc.returncode:
+            status=f'exited {proc.returncode}'
+        ts=now_iso()
+        data={
+            'file':f'videos/{out.name}' if out else None,
+            'bytes':out.stat().st_size if out and out.exists() else 0,
+            'started_at':STATE.usb_video_started_at,
+            'stopped_at':ts,
+            'status':status,
+            'return_code':proc.returncode,
+            'reason':reason
+        }
+        STATE.last_usb_video=data
+        STATE.usb_video_status=status
+        if out:
+            db_exec('insert into camera values(?,?,?,?,?,?)',(ts,f'videos/{out.name}',int(CONFIG.get('usb_video_width',1280)),int(CONFIG.get('usb_video_height',720)),'video_stop',json.dumps(data)))
+            print(f'USB video recording stopped: {out} ({data["bytes"]} bytes)', flush=True)
+    except Exception as e:
+        STATE.usb_video_status=f'stop error: {e}'
+        STATE.add_error(f'USB video recording stop: {e}')
+    finally:
+        STATE.usb_video_proc=None
+        STATE.usb_video_file=None
+        STATE.usb_video_started_at=None
+
 def live_camera_page():
     device=live_camera_device()
     devices=live_camera_devices()
@@ -917,8 +1035,8 @@ def ride_history_table(rides):
     for ride in rides:
         rid=html.escape(str(ride.get('id','')))
         url=quote(str(ride.get('id','')),safe='')
-        rows.append(f'''<tr><td><a href="/ride/{url}">{rid}</a></td><td>{html.escape(display_value(ride.get("started_at")))}</td><td>{html.escape(display_value(ride.get("stopped_at")))}</td><td>{ride.get("gps",0)}</td><td>{ride.get("photos",0)}</td><td>{ride.get("bluetooth",0)}</td></tr>''')
-    return f'<div class="table-wrap"><table><thead><tr><th>Ride</th><th>Started</th><th>Stopped</th><th>GPS rows</th><th>Photos</th><th>Bluetooth rows</th></tr></thead><tbody>{"".join(rows)}</tbody></table></div>'
+        rows.append(f'''<tr><td><a href="/ride/{url}">{rid}</a></td><td>{html.escape(display_value(ride.get("started_at")))}</td><td>{html.escape(display_value(ride.get("stopped_at")))}</td><td>{ride.get("gps",0)}</td><td>{ride.get("photos",0)}</td><td>{ride.get("videos",0)}</td><td>{ride.get("bluetooth",0)}</td></tr>''')
+    return f'<div class="table-wrap"><table><thead><tr><th>Ride</th><th>Started</th><th>Stopped</th><th>GPS rows</th><th>Photos</th><th>Video files</th><th>Bluetooth rows</th></tr></thead><tbody>{"".join(rows)}</tbody></table></div>'
 
 def page(title, body, refresh=None):
     refresh_tag=f'<meta http-equiv="refresh" content="{int(refresh)}">' if refresh else ''
@@ -1059,16 +1177,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send(page('Ride '+rid,body)); return
         if path=='/status.json':
             with STATE.lock:
-                obj={'version':APP_VERSION,'ride_id':STATE.ride_id,'started_at':STATE.started_at,'last_gps':STATE.last_gps,'last_env':STATE.last_env,'last_imu':STATE.last_imu,'last_ups':STATE.last_ups,'last_health':STATE.last_health,'last_camera':STATE.last_camera,'camera_status':STATE.camera_status,'last_wifi_count':STATE.last_wifi_count,'last_wifi_scan_at':STATE.last_wifi_scan_at,'last_wifi_devices':STATE.last_wifi_devices,'last_bluetooth_count':STATE.last_bluetooth_count,'last_bluetooth_devices':STATE.last_bluetooth_devices,'bluetooth_status':STATE.bluetooth_status,'errors':STATE.errors[-10:], 'rides_dir':str(RIDES_DIR)}
+                obj={'version':APP_VERSION,'ride_id':STATE.ride_id,'started_at':STATE.started_at,'last_gps':STATE.last_gps,'last_env':STATE.last_env,'last_imu':STATE.last_imu,'last_ups':STATE.last_ups,'last_health':STATE.last_health,'last_camera':STATE.last_camera,'camera_status':STATE.camera_status,'usb_video_status':STATE.usb_video_status,'last_usb_video':STATE.last_usb_video,'last_wifi_count':STATE.last_wifi_count,'last_wifi_scan_at':STATE.last_wifi_scan_at,'last_wifi_devices':STATE.last_wifi_devices,'last_bluetooth_count':STATE.last_bluetooth_count,'last_bluetooth_devices':STATE.last_bluetooth_devices,'bluetooth_status':STATE.bluetooth_status,'errors':STATE.errors[-10:], 'rides_dir':str(RIDES_DIR)}
             self.send(json.dumps(obj,indent=2,default=str),'application/json'); return
         rides=list_rides()
         with STATE.lock:
-            status={'ride_id':STATE.ride_id,'started_at':STATE.started_at,'gps':STATE.last_gps.copy(),'env':STATE.last_env.copy(),'imu':STATE.last_imu.copy(),'ups':STATE.last_ups.copy(),'health':STATE.last_health.copy(),'camera':STATE.camera_status,'camera_data':STATE.last_camera.copy(),'wifi_count':STATE.last_wifi_count,'wifi_scan_at':STATE.last_wifi_scan_at,'wifi_devices':list(STATE.last_wifi_devices),'bluetooth_count':STATE.last_bluetooth_count,'bluetooth_devices':list(STATE.last_bluetooth_devices),'bluetooth_status':STATE.bluetooth_status.copy(),'errors':STATE.errors[-8:]}
+            status={'ride_id':STATE.ride_id,'started_at':STATE.started_at,'gps':STATE.last_gps.copy(),'env':STATE.last_env.copy(),'imu':STATE.last_imu.copy(),'ups':STATE.last_ups.copy(),'health':STATE.last_health.copy(),'camera':STATE.camera_status,'camera_data':STATE.last_camera.copy(),'usb_video_status':STATE.usb_video_status,'usb_video_data':STATE.last_usb_video.copy(),'wifi_count':STATE.last_wifi_count,'wifi_scan_at':STATE.last_wifi_scan_at,'wifi_devices':list(STATE.last_wifi_devices),'bluetooth_count':STATE.last_bluetooth_count,'bluetooth_devices':list(STATE.last_bluetooth_devices),'bluetooth_status':STATE.bluetooth_status.copy(),'errors':STATE.errors[-8:]}
         env=next(iter(status['env'].values()),{}) if status['env'] else {}
         gps=status['gps']; imu=status['imu']; ups=status['ups']; health=status['health']; bt=status['bluetooth_status']
         ride_live=bool(status['ride_id'])
         controls='<div class="actions"><form method="post" action="/api/start"><button>Start ride</button></form><form method="post" action="/api/stop"><button class="stop">Stop ride</button></form><a class="button secondary" href="/camera">Live camera</a><a class="button secondary" href="/status.json">Raw status</a></div>'
-        ride_rows=[{'id':r.get('id'),'started_at':r.get('started_at'),'stopped_at':r.get('stopped_at'),'gps':r.get('gps',0),'photos':r.get('photos',0),'bluetooth':r.get('bluetooth',0)} for r in rides[:12]]
+        ride_rows=[{'id':r.get('id'),'started_at':r.get('started_at'),'stopped_at':r.get('stopped_at'),'gps':r.get('gps',0),'photos':r.get('photos',0),'videos':r.get('videos',0),'bluetooth':r.get('bluetooth',0)} for r in rides[:12]]
         camera=status['camera_data']
         bt_detail=bt.get('error') or '; '.join(bt.get('errors',[]))
         errors=''.join(f'<li>{html.escape(error)}</li>' for error in status['errors'])
@@ -1081,7 +1199,7 @@ class Handler(BaseHTTPRequestHandler):
 <section class="card"><h2>Environment</h2><div class="metrics">{metric("Temperature",display_value(env.get("temperature_c"),1," °C"))}{metric("Humidity",display_value(env.get("humidity_pct"),1," %"))}{metric("Pressure",display_value(env.get("pressure_hpa"),1," hPa"))}</div></section>
 <section class="card"><h2>UPS battery</h2><div class="metrics">{metric("Charge",display_value(ups.get("battery_percent"),1," %"),"good" if ups.get("battery_percent",0)>40 else "warn")}{metric("Bus voltage",display_value(ups.get("bus_voltage_v"),2," V"))}{metric("Supply voltage",display_value(ups.get("supply_voltage_v"),2," V"))}{metric("Shunt",display_value(ups.get("shunt_voltage_mv"),2," mV"))}{metric("Current",display_value(ups.get("current_ma"),0," mA"))}{metric("Power",display_value(ups.get("power_w"),2," W"))}{metric("State",display_value(ups.get("state")))}</div></section>
 <section class="card wide"><h2>Motion / IMU</h2><div class="metrics">{metric("Accel X",display_value(imu.get("accel_x_g"),3," g"))}{metric("Accel Y",display_value(imu.get("accel_y_g"),3," g"))}{metric("Accel Z",display_value(imu.get("accel_z_g"),3," g"))}{metric("Gyro X",display_value(imu.get("gyro_x_dps"),1," °/s"))}{metric("Gyro Y",display_value(imu.get("gyro_y_dps"),1," °/s"))}{metric("Gyro Z",display_value(imu.get("gyro_z_dps"),1," °/s"))}{metric("Mag X",display_value(imu.get("mag_x_gauss"),3," G"))}{metric("Mag Y",display_value(imu.get("mag_y_gauss"),3," G"))}{metric("Mag Z",display_value(imu.get("mag_z_gauss"),3," G"))}</div></section>
-<section class="card"><h2>System / camera</h2><div class="metrics">{metric("CPU",display_value(health.get("cpu_temp_c"),1," °C"))}{metric("Load",display_value(health.get("load1"),2))}{metric("Memory free",display_value(health.get("mem_available_kb"),0," kB"))}{metric("Disk free",display_value(health.get("disk_free_mb"),0," MB"))}{metric("Throttle",display_value(health.get("throttled")))}{metric("Camera",status["camera"])}{metric("Last capture",display_value(camera.get("captured_at")))}</div></section>
+<section class="card"><h2>System / camera</h2><div class="metrics">{metric("CPU",display_value(health.get("cpu_temp_c"),1," °C"))}{metric("Load",display_value(health.get("load1"),2))}{metric("Memory free",display_value(health.get("mem_available_kb"),0," kB"))}{metric("Disk free",display_value(health.get("disk_free_mb"),0," MB"))}{metric("Throttle",display_value(health.get("throttled")))}{metric("Camera",status["camera"])}{metric("USB video",status["usb_video_status"])}{metric("Last capture",display_value(camera.get("captured_at")))}</div></section>
 <section class="card full"><h2>Latest photos</h2>{photo_gallery(latest_photos(8))}</section>
 <section class="card wide"><h2>Bluetooth devices</h2><p class="muted">Scan: {html.escape(display_value(bt.get("state")))} · {html.escape(display_value(bt.get("finished_at")))} · {status["bluetooth_count"]} devices{(" · "+html.escape(bt_detail)) if bt_detail else ""}</p>{data_table(status["bluetooth_devices"],[("name","Name"),("address","Address"),("address_type","Type"),("rssi_dbm","RSSI dBm")],"No Bluetooth devices reported by the last scan.")}</section>
 <section class="card full"><h2>Most Recent WiFi Hotspots</h2><p class="muted">{status["wifi_count"]} networks · last scan {html.escape(display_value(status["wifi_scan_at"]))} · strongest signal first</p>{data_table(status["wifi_devices"],[("ssid","SSID"),("bssid","BSSID"),("signal_dbm","Signal dBm"),("channel","Channel"),("freq_mhz","Frequency MHz"),("iface","Interface")],"No WiFi hotspots reported by the last scan.")}</section>
