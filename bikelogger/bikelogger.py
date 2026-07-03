@@ -872,20 +872,36 @@ def photo_gallery(photos):
     return f'<div class="gallery">{"".join(items)}</div>'
 
 def live_camera_devices():
-    return sorted(str(p) for p in Path('/dev').glob('video*') if p.exists())
+    devices=[]
+    for path in sorted(Path('/dev').glob('video*')):
+        name_path=Path('/sys/class/video4linux') / path.name / 'name'
+        try:
+            name=name_path.read_text().strip()
+        except Exception:
+            name=''
+        devices.append({'path':str(path),'name':name})
+    return devices
 
 def live_camera_device():
     configured=CONFIG.get('live_camera_device') or CONFIG.get('usb_camera_device')
     if configured:
         return str(configured)
     devices=live_camera_devices()
-    return devices[0] if devices else '/dev/video0'
+    for device in devices:
+        name=device.get('name','').lower()
+        if any(word in name for word in ('webcam','usb','uvc','logitech','camera c')):
+            return device['path']
+    for device in devices:
+        name=device.get('name','').lower()
+        if not any(word in name for word in ('codec','isp','unicam','metadata','hevc')):
+            return device['path']
+    return devices[0]['path'] if devices else '/dev/video0'
 
 def live_camera_page():
     device=live_camera_device()
     devices=live_camera_devices()
     ffmpeg=shutil.which('ffmpeg')
-    device_text=', '.join(devices) if devices else 'none found'
+    device_text=', '.join(f'{d["path"]} ({d["name"]})' if d.get('name') else d['path'] for d in devices) if devices else 'none found'
     stream=f'/camera/stream?device={quote(device,safe="/")}'
     status='ffmpeg found' if ffmpeg else 'ffmpeg not found'
     body=f'''<header><div><a href="/">← Dashboard</a><h1>Live camera</h1><div class="muted">Device {html.escape(device)} · video devices: {html.escape(device_text)} · {html.escape(status)}</div></div></header>
@@ -946,26 +962,33 @@ class Handler(BaseHTTPRequestHandler):
         width=int(CONFIG.get('live_camera_width',1280))
         height=int(CONFIG.get('live_camera_height',720))
         fps=int(CONFIG.get('live_camera_fps',15))
+        fmt=str(CONFIG.get('live_camera_input_format','mjpeg'))
         command=[
             ffmpeg,'-hide_banner','-loglevel','warning',
-            '-f','v4l2','-input_format','mjpeg',
+            '-f','v4l2','-input_format',fmt,
             '-framerate',str(fps),'-video_size',f'{width}x{height}',
             '-i',device,'-an','-c:v','copy','-f','mpjpeg','-'
         ]
         proc=None
         try:
-            proc=subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+            proc=subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
             self.send_response(200)
             self.send_header('Content-Type','multipart/x-mixed-replace; boundary=ffmpeg')
             self.send_header('Cache-Control','no-store')
             self.send_header('Pragma','no-cache')
             self.end_headers()
+            sent=False
             while RUNNING:
                 chunk=proc.stdout.read(16384)
                 if not chunk:
                     break
+                sent=True
                 self.wfile.write(chunk)
                 self.wfile.flush()
+            if not sent and proc.poll() is not None:
+                err=(proc.stderr.read() or b'').decode('utf-8','replace').strip()
+                if err:
+                    STATE.add_error(f'Live camera stream: {err.splitlines()[-1]}')
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as e:
