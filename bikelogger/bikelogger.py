@@ -871,6 +871,29 @@ def photo_gallery(photos):
         items.append(f'<a class="photo" href="{url}"><img loading="lazy" src="{url}" alt="Ride photo"><span>{html.escape(photo["mtime"])}</span></a>')
     return f'<div class="gallery">{"".join(items)}</div>'
 
+def live_camera_devices():
+    return sorted(str(p) for p in Path('/dev').glob('video*') if p.exists())
+
+def live_camera_device():
+    configured=CONFIG.get('live_camera_device') or CONFIG.get('usb_camera_device')
+    if configured:
+        return str(configured)
+    devices=live_camera_devices()
+    return devices[0] if devices else '/dev/video0'
+
+def live_camera_page():
+    device=live_camera_device()
+    devices=live_camera_devices()
+    ffmpeg=shutil.which('ffmpeg')
+    device_text=', '.join(devices) if devices else 'none found'
+    stream=f'/camera/stream?device={quote(device,safe="/")}'
+    status='ffmpeg found' if ffmpeg else 'ffmpeg not found'
+    body=f'''<header><div><a href="/">← Dashboard</a><h1>Live camera</h1><div class="muted">Device {html.escape(device)} · video devices: {html.escape(device_text)} · {html.escape(status)}</div></div></header>
+<section class="card full">
+<div class="stream-wrap"><img class="stream" src="{stream}" alt="Live camera stream"></div>
+</section>'''
+    return page('Live camera',body)
+
 def ride_history_table(rides):
     if not rides:
         return '<p class="muted">No rides yet.</p>'
@@ -895,6 +918,7 @@ h1,h2,h3{{margin:.15rem 0}}h1{{font-size:clamp(1.6rem,4vw,2.5rem)}}h2{{font-size
 .metrics{{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:.55rem;margin-top:.7rem}}.metric{{background:#0b1627;border:1px solid #22334d;border-radius:.6rem;padding:.65rem}}.metric span{{display:block;color:var(--muted);font-size:.78rem}}.metric strong{{display:block;font-size:1.15rem;margin-top:.15rem;overflow-wrap:anywhere}}.metric.good strong{{color:var(--green)}}.metric.warn strong{{color:var(--amber)}}.metric.bad strong{{color:var(--red)}}
 .table-wrap{{overflow:auto;margin-top:.6rem}}table{{border-collapse:collapse;width:100%;font-size:.88rem}}th,td{{text-align:left;border-bottom:1px solid var(--line);padding:.5rem;white-space:nowrap}}th{{color:var(--muted);font-weight:600}}
 .gallery{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.65rem;margin-top:.7rem}}.photo{{position:relative;display:block;min-height:130px;border-radius:.6rem;overflow:hidden;background:#050a12}}.photo img{{width:100%;height:180px;object-fit:cover;display:block}}.photo span{{position:absolute;bottom:0;left:0;right:0;padding:.35rem .5rem;background:#000a;color:#fff;font-size:.72rem}}
+.stream-wrap{{background:#050a12;border:1px solid var(--line);border-radius:.6rem;overflow:hidden}}.stream{{display:block;width:100%;max-height:calc(100vh - 180px);object-fit:contain;background:#050a12}}
 .errors{{margin:.6rem 0 0;padding-left:1.2rem;color:#ffb6b6}}pre{{background:#07101d;border:1px solid var(--line);padding:.7rem;border-radius:.5rem;white-space:pre-wrap;overflow-wrap:anywhere;color:#bdd0e8}}
 @media(max-width:900px){{.card,.wide{{grid-column:1/-1}}}}@media(max-width:520px){{main{{padding:.7rem}}.photo img{{height:145px}}}}
 </style></head><body><main>{body}</main></body></html>'''
@@ -911,6 +935,46 @@ class Handler(BaseHTTPRequestHandler):
     def send(self, content, ctype='text/html', code=200):
         if isinstance(content,str): content=content.encode()
         self.send_response(code); self.send_header('Content-Type',ctype); self.send_header('Content-Length',str(len(content))); self.end_headers(); self.wfile.write(content)
+    def stream_live_camera(self, device):
+        if not re.fullmatch(r'/dev/video[0-9]+',device or ''):
+            self.send('invalid camera device','text/plain',400); return
+        ffmpeg=shutil.which('ffmpeg')
+        if not ffmpeg:
+            self.send('ffmpeg is required for live USB camera streaming','text/plain',503); return
+        if not Path(device).exists():
+            self.send(f'camera device not found: {device}','text/plain',404); return
+        width=int(CONFIG.get('live_camera_width',1280))
+        height=int(CONFIG.get('live_camera_height',720))
+        fps=int(CONFIG.get('live_camera_fps',15))
+        command=[
+            ffmpeg,'-hide_banner','-loglevel','warning',
+            '-f','v4l2','-input_format','mjpeg',
+            '-framerate',str(fps),'-video_size',f'{width}x{height}',
+            '-i',device,'-an','-c:v','copy','-f','mpjpeg','-'
+        ]
+        proc=None
+        try:
+            proc=subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+            self.send_response(200)
+            self.send_header('Content-Type','multipart/x-mixed-replace; boundary=ffmpeg')
+            self.send_header('Cache-Control','no-store')
+            self.send_header('Pragma','no-cache')
+            self.end_headers()
+            while RUNNING:
+                chunk=proc.stdout.read(16384)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            STATE.add_error(f'Live camera stream: {e}')
+        finally:
+            if proc:
+                proc.terminate()
+                try: proc.wait(timeout=2)
+                except Exception: proc.kill()
     def redirect(self, location='/'):
         self.send_response(303)
         self.send_header('Location',location)
@@ -930,6 +994,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send('not found','text/plain',404)
     def do_GET(self):
         u=urlparse(self.path); path=u.path
+        if path=='/camera/stream':
+            device=parse_qs(u.query).get('device',[live_camera_device()])[0]
+            self.stream_live_camera(device); return
+        if path=='/camera':
+            self.send(live_camera_page()); return
         if path.startswith('/ride/') and '/photos/' in path:
             parts=path.split('/')
             rid=parts[2]; fname=parts[-1]
@@ -975,7 +1044,7 @@ class Handler(BaseHTTPRequestHandler):
         env=next(iter(status['env'].values()),{}) if status['env'] else {}
         gps=status['gps']; imu=status['imu']; ups=status['ups']; health=status['health']; bt=status['bluetooth_status']
         ride_live=bool(status['ride_id'])
-        controls='<div class="actions"><form method="post" action="/api/start"><button>Start ride</button></form><form method="post" action="/api/stop"><button class="stop">Stop ride</button></form><a class="button secondary" href="/status.json">Raw status</a></div>'
+        controls='<div class="actions"><form method="post" action="/api/start"><button>Start ride</button></form><form method="post" action="/api/stop"><button class="stop">Stop ride</button></form><a class="button secondary" href="/camera">Live camera</a><a class="button secondary" href="/status.json">Raw status</a></div>'
         ride_rows=[{'id':r.get('id'),'started_at':r.get('started_at'),'stopped_at':r.get('stopped_at'),'gps':r.get('gps',0),'photos':r.get('photos',0),'bluetooth':r.get('bluetooth',0)} for r in rides[:12]]
         camera=status['camera_data']
         bt_detail=bt.get('error') or '; '.join(bt.get('errors',[]))
