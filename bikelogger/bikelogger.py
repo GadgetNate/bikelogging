@@ -4,7 +4,7 @@ Features: GPIO start/stop, serial GPS NMEA at 38400, BME280, Pololu LSM303DLHC,
 Waveshare UPS HAT power monitoring, persistent Picamera2 autofocus capture,
 plain-text WiFi scans, built-in Bluetooth device/RSSI scans, health logging, per-ride SQLite, local web history browser.
 """
-import os, sys, time, json, math, glob, sqlite3, threading, subprocess, shutil, signal, html, re
+import os, sys, time, json, math, glob, sqlite3, threading, subprocess, shutil, signal, html, re, mimetypes
 from datetime import datetime, timezone
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -819,7 +819,7 @@ def list_rides():
         if not d.is_dir(): continue
         dbp=d/'ride.sqlite'; photos=list((d/'photos').glob('*.jpg')) if (d/'photos').exists() else []
         info={'id':d.name,'photos':len(photos),'path':str(d)}
-        info['videos']=len(list((d/'videos').glob('*'))) if (d/'videos').exists() else 0
+        info['videos']=len([p for p in (d/'videos').glob('*') if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS]) if (d/'videos').exists() else 0
         if dbp.exists():
             try:
                 db=sqlite3.connect(str(dbp));
@@ -882,6 +882,51 @@ def photo_gallery(photos):
         url=f'/ride/{rid}/photos/{name}'
         items.append(f'<a class="photo" href="{url}"><img loading="lazy" src="{url}" alt="Ride photo"><span>{html.escape(photo["mtime"])}</span></a>')
     return f'<div class="gallery">{"".join(items)}</div>'
+
+VIDEO_EXTENSIONS={'.mp4','.m4v','.mov','.webm','.mkv','.avi'}
+BROWSER_VIDEO_EXTENSIONS={'.mp4','.m4v','.mov','.webm'}
+
+def ride_videos(ride_id=None, limit=None):
+    candidates=[]
+    if ride_id:
+        candidates=[RIDES_DIR/ride_id]
+    else:
+        with STATE.lock:
+            active=STATE.ride_id
+        if active:
+            candidates.append(RIDES_DIR/active)
+        candidates.extend(d for d in sorted(RIDES_DIR.glob('*'),reverse=True) if d not in candidates)
+    videos=[]
+    for ride_dir in candidates:
+        video_dir=ride_dir/'videos'
+        if not video_dir.exists():
+            continue
+        for path in sorted(video_dir.glob('*'),key=lambda p:p.stat().st_mtime,reverse=True):
+            if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS:
+                videos.append({
+                    'ride_id':ride_dir.name,
+                    'file':path.name,
+                    'size_mb':path.stat().st_size/(1024*1024),
+                    'mtime':datetime.fromtimestamp(path.stat().st_mtime).astimezone().isoformat(timespec='seconds'),
+                    'playable':path.suffix.lower() in BROWSER_VIDEO_EXTENSIONS
+                })
+                if limit and len(videos) >= limit:
+                    return videos
+        if ride_id and videos:
+            break
+    return videos
+
+def video_gallery(videos):
+    if not videos:
+        return '<p class="muted">No videos recorded yet.</p>'
+    items=[]
+    for video in videos:
+        rid=quote(video['ride_id'],safe='')
+        name=quote(video['file'],safe='')
+        url=f'/ride/{rid}/videos/{name}'
+        player=f'<video controls preload="metadata" src="{url}"></video>' if video.get('playable') else '<div class="video-placeholder">Browser playback may require BikeHub preparation.</div>'
+        items.append(f'''<article class="video-card">{player}<div><strong>{html.escape(video["file"])}</strong><span>{html.escape(video["mtime"])} · {video["size_mb"]:.1f} MB</span><a class="button secondary" href="{url}">Open video file</a></div></article>''')
+    return f'<div class="videos">{"".join(items)}</div>'
 
 def live_camera_devices():
     devices=[]
@@ -1052,6 +1097,7 @@ h1,h2,h3{{margin:.15rem 0}}h1{{font-size:clamp(1.6rem,4vw,2.5rem)}}h2{{font-size
 .metrics{{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:.55rem;margin-top:.7rem}}.metric{{background:#0b1627;border:1px solid #22334d;border-radius:.6rem;padding:.65rem}}.metric span{{display:block;color:var(--muted);font-size:.78rem}}.metric strong{{display:block;font-size:1.15rem;margin-top:.15rem;overflow-wrap:anywhere}}.metric.good strong{{color:var(--green)}}.metric.warn strong{{color:var(--amber)}}.metric.bad strong{{color:var(--red)}}
 .table-wrap{{overflow:auto;margin-top:.6rem}}table{{border-collapse:collapse;width:100%;font-size:.88rem}}th,td{{text-align:left;border-bottom:1px solid var(--line);padding:.5rem;white-space:nowrap}}th{{color:var(--muted);font-weight:600}}
 .gallery{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.65rem;margin-top:.7rem}}.photo{{position:relative;display:block;min-height:130px;border-radius:.6rem;overflow:hidden;background:#050a12}}.photo img{{width:100%;height:180px;object-fit:cover;display:block}}.photo span{{position:absolute;bottom:0;left:0;right:0;padding:.35rem .5rem;background:#000a;color:#fff;font-size:.72rem}}
+.videos{{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:.8rem;margin-top:.7rem}}.video-card{{background:#07101d;border:1px solid var(--line);border-radius:.6rem;overflow:hidden}}.video-card video,.video-placeholder{{display:block;width:100%;aspect-ratio:16/9;background:#050a12}}.video-placeholder{{display:grid;place-items:center;padding:1rem;color:var(--muted);text-align:center}}.video-card>div{{display:grid;gap:.45rem;padding:.75rem}}.video-card span{{color:var(--muted);font-size:.82rem;overflow-wrap:anywhere}}
 .stream-wrap{{background:#050a12;border:1px solid var(--line);border-radius:.6rem;overflow:hidden}}.stream{{display:block;width:100%;max-height:calc(100vh - 180px);object-fit:contain;background:#050a12}}
 .errors{{margin:.6rem 0 0;padding-left:1.2rem;color:#ffb6b6}}pre{{background:#07101d;border:1px solid var(--line);padding:.7rem;border-radius:.5rem;white-space:pre-wrap;overflow-wrap:anywhere;color:#bdd0e8}}
 @media(max-width:900px){{.card,.wide{{grid-column:1/-1}}}}@media(max-width:520px){{main{{padding:.7rem}}.photo img{{height:145px}}}}
@@ -1069,6 +1115,40 @@ class Handler(BaseHTTPRequestHandler):
     def send(self, content, ctype='text/html', code=200):
         if isinstance(content,str): content=content.encode()
         self.send_response(code); self.send_header('Content-Type',ctype); self.send_header('Content-Length',str(len(content))); self.end_headers(); self.wfile.write(content)
+    def send_file(self, path, ctype=None):
+        path=Path(path)
+        if not path.is_file():
+            self.send('not found','text/plain',404); return
+        ctype=ctype or mimetypes.guess_type(path.name)[0] or 'application/octet-stream'
+        size=path.stat().st_size
+        start=0; end=size-1; code=200
+        range_header=self.headers.get('Range','')
+        match=re.fullmatch(r'bytes=(\d*)-(\d*)',range_header.strip()) if range_header else None
+        if match:
+            code=206
+            if match.group(1):
+                start=int(match.group(1))
+            if match.group(2):
+                end=int(match.group(2))
+            start=max(0,min(start,size-1 if size else 0))
+            end=max(start,min(end,size-1 if size else 0))
+        length=max(0,end-start+1)
+        self.send_response(code)
+        self.send_header('Content-Type',ctype)
+        self.send_header('Accept-Ranges','bytes')
+        self.send_header('Content-Length',str(length))
+        if code == 206:
+            self.send_header('Content-Range',f'bytes {start}-{end}/{size}')
+        self.end_headers()
+        with path.open('rb') as fh:
+            fh.seek(start)
+            remaining=length
+            while remaining:
+                chunk=fh.read(min(1024*1024,remaining))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                remaining-=len(chunk)
     def stream_live_camera(self, device):
         if not re.fullmatch(r'/dev/video[0-9]+',device or ''):
             self.send('invalid camera device','text/plain',400); return
@@ -1140,6 +1220,13 @@ class Handler(BaseHTTPRequestHandler):
             self.stream_live_camera(device); return
         if path=='/camera':
             self.send(live_camera_page()); return
+        if path.startswith('/ride/') and '/videos/' in path:
+            parts=path.split('/')
+            rid=parts[2]; fname=parts[-1]
+            if not re.fullmatch(r'[A-Za-z0-9_.-]+',rid) or Path(fname).name != fname or Path(fname).suffix.lower() not in VIDEO_EXTENSIONS:
+                self.send('not found','text/plain',404); return
+            fp=RIDES_DIR/rid/'videos'/fname
+            self.send_file(fp); return
         if path.startswith('/ride/') and '/photos/' in path:
             parts=path.split('/')
             rid=parts[2]; fname=parts[-1]
@@ -1169,6 +1256,7 @@ class Handler(BaseHTTPRequestHandler):
 <section class="card">{metric("GPS",f'{display_value(gps.get("lat"),6)}, {display_value(gps.get("lon"),6)}')}{metric("Speed",display_value(gps.get("speed_knots"),1," kn"))}{metric("Satellites",display_value(gps.get("sats")))}</section>
 <section class="card">{metric("Temperature",display_value(env.get("temperature_c"),1," °C"))}{metric("Humidity",display_value(env.get("humidity_pct"),1," %"))}{metric("Pressure",display_value(env.get("pressure_hpa"),1," hPa"))}</section>
 <section class="card">{metric("Battery",display_value(ups.get("battery_percent"),1," %"))}{metric("Voltage",display_value(ups.get("bus_voltage_v"),2," V"))}{metric("Current",display_value(ups.get("current_ma"),0," mA"))}</section>
+<section class="card full"><h2>Ride videos</h2>{video_gallery(ride_videos(rid))}</section>
 <section class="card full"><h2>Latest photos</h2>{photo_gallery(latest_photos(12,rid))}</section>
 <section class="card wide"><h2>Bluetooth observations</h2>{data_table(bluetooth,[("ts","Time"),("name","Name"),("address","Address"),("address_type","Type"),("rssi_dbm","RSSI dBm")])}</section>
 <section class="card"><h2>Ride totals</h2><pre>{html.escape(json.dumps(counts,indent=2))}</pre></section>
@@ -1200,6 +1288,7 @@ class Handler(BaseHTTPRequestHandler):
 <section class="card"><h2>UPS battery</h2><div class="metrics">{metric("Charge",display_value(ups.get("battery_percent"),1," %"),"good" if ups.get("battery_percent",0)>40 else "warn")}{metric("Bus voltage",display_value(ups.get("bus_voltage_v"),2," V"))}{metric("Supply voltage",display_value(ups.get("supply_voltage_v"),2," V"))}{metric("Shunt",display_value(ups.get("shunt_voltage_mv"),2," mV"))}{metric("Current",display_value(ups.get("current_ma"),0," mA"))}{metric("Power",display_value(ups.get("power_w"),2," W"))}{metric("State",display_value(ups.get("state")))}</div></section>
 <section class="card wide"><h2>Motion / IMU</h2><div class="metrics">{metric("Accel X",display_value(imu.get("accel_x_g"),3," g"))}{metric("Accel Y",display_value(imu.get("accel_y_g"),3," g"))}{metric("Accel Z",display_value(imu.get("accel_z_g"),3," g"))}{metric("Gyro X",display_value(imu.get("gyro_x_dps"),1," °/s"))}{metric("Gyro Y",display_value(imu.get("gyro_y_dps"),1," °/s"))}{metric("Gyro Z",display_value(imu.get("gyro_z_dps"),1," °/s"))}{metric("Mag X",display_value(imu.get("mag_x_gauss"),3," G"))}{metric("Mag Y",display_value(imu.get("mag_y_gauss"),3," G"))}{metric("Mag Z",display_value(imu.get("mag_z_gauss"),3," G"))}</div></section>
 <section class="card"><h2>System / camera</h2><div class="metrics">{metric("CPU",display_value(health.get("cpu_temp_c"),1," °C"))}{metric("Load",display_value(health.get("load1"),2))}{metric("Memory free",display_value(health.get("mem_available_kb"),0," kB"))}{metric("Disk free",display_value(health.get("disk_free_mb"),0," MB"))}{metric("Throttle",display_value(health.get("throttled")))}{metric("Camera",status["camera"])}{metric("USB video",status["usb_video_status"])}{metric("Last capture",display_value(camera.get("captured_at")))}</div></section>
+<section class="card full"><h2>Latest videos</h2>{video_gallery(ride_videos(limit=4))}</section>
 <section class="card full"><h2>Latest photos</h2>{photo_gallery(latest_photos(8))}</section>
 <section class="card wide"><h2>Bluetooth devices</h2><p class="muted">Scan: {html.escape(display_value(bt.get("state")))} · {html.escape(display_value(bt.get("finished_at")))} · {status["bluetooth_count"]} devices{(" · "+html.escape(bt_detail)) if bt_detail else ""}</p>{data_table(status["bluetooth_devices"],[("name","Name"),("address","Address"),("address_type","Type"),("rssi_dbm","RSSI dBm")],"No Bluetooth devices reported by the last scan.")}</section>
 <section class="card full"><h2>Most Recent WiFi Hotspots</h2><p class="muted">{status["wifi_count"]} networks · last scan {html.escape(display_value(status["wifi_scan_at"]))} · strongest signal first</p>{data_table(status["wifi_devices"],[("ssid","SSID"),("bssid","BSSID"),("signal_dbm","Signal dBm"),("channel","Channel"),("freq_mhz","Frequency MHz"),("iface","Interface")],"No WiFi hotspots reported by the last scan.")}</section>
